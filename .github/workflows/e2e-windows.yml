@@ -10,20 +10,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e2e:
+  build-installer:
+    name: Build Hermes-Setup.exe
     runs-on: windows-latest
-    timeout-minutes: 60
-
-    env:
-      # Isolated install directory so the real install flow doesn't touch the
-      # runner's user profile. Kept under the workspace for easy cleanup.
-      HERMES_HOME: ${{ github.workspace }}\.e2e-hermes-home
+    timeout-minutes: 30
+    outputs:
+      cache-hit: ${{ steps.installer-cache.outputs.cache-hit }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Check installer source changes
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
+        uses: dorny/paths-filter@de90cc6fb38fc0963be72b67af2fb585800145a6 # v3.0.2
         id: changes
         with:
           filters: |
@@ -32,7 +30,7 @@ jobs:
               - 'apps/bootstrap-installer/**'
 
       - name: Restore installer build cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a986c91a # v4.2.0
         id: installer-cache
         with:
           path: |
@@ -52,32 +50,20 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "needed=$needed"
           Write-Host "installer-changed=$('${{ steps.changes.outputs.installer }}') cache-hit=$('${{ steps.installer-cache.outputs.cache-hit }}') build-needed=$needed"
 
-      - name: Install AutoHotkey v2
-        shell: pwsh
-        run: |
-          winget install -e --id AutoHotkey.AutoHotkey --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
-          $ahkDir = "$env:LOCALAPPDATA\Programs\AutoHotkey\v2"
-          Add-Content -Path $env:GITHUB_PATH -Value $ahkDir
-
-      - name: Install ffmpeg
-        shell: pwsh
-        run: |
-          winget install -e --id Gyan.FFmpeg --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
-          $wingetLinks = "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
-          echo $wingetLinks | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
       - name: Setup Node.js
+        if: steps.build-needed.outputs.needed == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
-      - name: Install npm dependencies
-        run: npm ci
-
       - name: Setup Rust
         if: steps.build-needed.outputs.needed == 'true'
         uses: dtolnay/rust-toolchain@1.96.0 # stable
+
+      - name: Install npm dependencies
+        if: steps.build-needed.outputs.needed == 'true'
+        run: npm ci
 
       - name: Cache Rust targets
         if: steps.build-needed.outputs.needed == 'true'
@@ -85,7 +71,6 @@ jobs:
         with:
           workspaces: apps/bootstrap-installer/src-tauri
 
-      # ── Build the bootstrap installer (Tauri) ──────────────────────
       - name: Build installer
         if: steps.build-needed.outputs.needed == 'true'
         run: npm run tauri:build
@@ -96,13 +81,11 @@ jobs:
           # install script checks out this PR/code rather than remote main.
           HERMES_BUILD_PIN_COMMIT: ${{ github.sha }}
 
-      # ── Stage the real installer binary as a user download ──────────
-      - name: Stage Hermes-Setup.exe in Downloads
+      # Locate the built exe and normalize its name for downstream jobs.
+      # This runs after a build OR after a cache restore, so the file exists.
+      - name: Normalize installer artifact name
         shell: pwsh
         run: |
-          $downloads = [Environment]::GetFolderPath('UserProfile') + '\Downloads'
-          New-Item -ItemType Directory -Path $downloads -Force | Out-Null
-
           $candidates = @(
             'apps/bootstrap-installer/src-tauri/target/release/bundle/app/Hermes.exe',
             'apps/bootstrap-installer/src-tauri/target/release/bundle/app/Hermes_0.0.1_x64.exe',
@@ -121,10 +104,62 @@ jobs:
               -Recurse -Filter '*.exe' | Where-Object { $_.Name -notlike '*setup*' -or $true } | Select-Object -First 1 -ExpandProperty FullName
           }
           if (-not $installer) {
-            throw 'Could not find built Hermes-Setup.exe after tauri build'
+            throw 'Could not find built Hermes-Setup.exe'
           }
-          Copy-Item -Path $installer -Destination "$downloads\Hermes-Setup.exe" -Force
-          Write-Host "Staged installer: $downloads\Hermes-Setup.exe (from $installer)"
+          Copy-Item -Path $installer -Destination 'Hermes-Setup.exe' -Force
+          Write-Host "Normalized installer: Hermes-Setup.exe (from $installer)"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Hermes-Setup
+          path: Hermes-Setup.exe
+          if-no-files-found: error
+
+  e2e:
+    name: E2E — Windows Desktop
+    needs: build-installer
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    env:
+      # Isolated install directory so the real install flow doesn't touch the
+      # runner's user profile. Kept under the workspace for easy cleanup.
+      HERMES_HOME: ${{ github.workspace }}\.e2e-hermes-home
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download installer artifact
+        uses: actions/download-artifact@b14cf47cd926d1cf2d3e09c0a44be020322580ec # v4.0.0
+        with:
+          name: Hermes-Setup
+
+      - name: Install AutoHotkey v2
+        shell: pwsh
+        run: |
+          winget install -e --id AutoHotkey.AutoHotkey --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
+          $ahkDir = "$env:LOCALAPPDATA\Programs\AutoHotkey\v2"
+          Add-Content -Path $env:GITHUB_PATH -Value $ahkDir
+
+      - name: Install ffmpeg
+        shell: pwsh
+        run: |
+          winget install -e --id Gyan.FFmpeg --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
+          $wingetLinks = "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
+          echo $wingetLinks | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # ── Stage the real installer binary as a user download ──────────
+      - name: Stage Hermes-Setup.exe in Downloads
+        shell: pwsh
+        run: |
+          $downloads = [Environment]::GetFolderPath('UserProfile') + '\Downloads'
+          New-Item -ItemType Directory -Path $downloads -Force | Out-Null
+          if (-not (Test-Path 'Hermes-Setup.exe')) {
+            throw 'Hermes-Setup.exe artifact was not downloaded'
+          }
+          Copy-Item -Path 'Hermes-Setup.exe' -Destination "$downloads\Hermes-Setup.exe" -Force
+          Write-Host "Staged installer: $downloads\Hermes-Setup.exe"
 
       # ── Prepare an isolated HERMES_HOME and pre-clone the repo ──────
       # This lets install.ps1 use the local checkout as its git origin,
@@ -191,7 +226,7 @@ jobs:
           '@
           $ahk | Out-File -Encoding utf8 "capture-button.ahk"
 
-          $ahkProc = Start-Process AutoHotkey64
+          $ahkProc = Start-Process -FilePath "$env:RUNNER_TEMP\AutoHotkey64.exe" `
             -ArgumentList '"capture-button.ahk"' -PassThru -NoNewWindow `
             -RedirectStandardOutput ahk-stdout.log -RedirectStandardError ahk-stderr.log
 
