@@ -386,8 +386,19 @@ function Install-Uv {
         # Spawn via the resolved host exe (see Get-PowerShellHostExe) rather
         # than a bare `powershell`, which isn't guaranteed to be on PATH under
         # PowerShell 7 / pwsh-only setups.
+        #
+        # NOTE: we deliberately do NOT pass `-ExecutionPolicy ByPass` here.
+        # That parameter forces powershell.exe to invoke Get-ExecutionPolicy
+        # (from the Microsoft.PowerShell.Security module) at startup, and on
+        # some Windows installs that module fails to load -- killing the
+        # child process before `irm | iex` ever runs (field report: uv stage
+        # aborts with "The 'Get-ExecutionPolicy' command was found in the
+        # module 'Microsoft.PowerShell.Security', but the module could not be
+        # loaded"). It's also redundant: execution policy only gates .ps1
+        # files on disk. `irm | iex` runs the downloaded string in-memory as
+        # if typed at the prompt, which execution policy does not gate.
         $psHostExe = Get-PowerShellHostExe
-        $uvInstallLog = & $psHostExe -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex" 2>&1
+        $uvInstallLog = & $psHostExe -c "irm https://astral.sh/uv/install.ps1 | iex" 2>&1
         $uvInstallExit = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP
 
