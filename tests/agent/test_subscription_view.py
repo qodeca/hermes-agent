@@ -66,10 +66,6 @@ def test_parser_maps_camelCase_payload_fields():
             "cancelAtPeriodEnd": True,
             "cancellationEffectiveAt": "2026-07-01",
         },
-        "tiers": [
-            {"tierId": "free", "name": "Free", "tierOrder": 0, "monthlyCredits": "0"},
-            {"tierId": "plus", "name": "Plus", "tierOrder": 1, "dollarsPerMonth": "20", "monthlyCredits": "1000", "isCurrent": True},
-        ],
     }
     s = subscription_state_from_payload(payload, portal_url="https://p/billing")
 
@@ -80,8 +76,6 @@ def test_parser_maps_camelCase_payload_fields():
     assert s.current.tier_name == "Plus"
     assert s.current.cancel_at_period_end is True
     assert s.current.monthly_credits == Decimal("1000")
-    assert len(s.tiers) == 2
-    assert s.tiers[1].is_current is True
 
 
 def test_parser_no_plan_is_none_not_all_null_object():
@@ -113,7 +107,7 @@ def test_no_fixture_when_env_unset(monkeypatch):
 @pytest.mark.parametrize(
     "name,checker",
     [
-        ("free", lambda s: s.logged_in and s.current is None and len(s.tiers) == 4),
+        ("free", lambda s: s.logged_in and s.current is None),
         ("mid", lambda s: s.current and s.current.tier_id == "plus"),
         ("top", lambda s: s.current and s.current.tier_id == "ultra"),
         ("not-admin", lambda s: s.role == "MEMBER" and not s.can_change_plan),

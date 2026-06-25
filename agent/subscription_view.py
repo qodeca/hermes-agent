@@ -33,19 +33,6 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class SubscriptionTier:
-    """A plan tier in the catalog."""
-
-    tier_id: str
-    name: str
-    tier_order: int
-    dollars_per_month: Optional[Decimal] = None
-    monthly_credits: Optional[Decimal] = None
-    is_current: bool = False
-    is_enabled: bool = True
-
-
-@dataclass(frozen=True)
 class CurrentSubscription:
     """The user's active subscription. ``None`` (not this object) = no plan.
 
@@ -80,7 +67,6 @@ class SubscriptionState:
     role: Optional[str] = None  # "OWNER" | "ADMIN" | "MEMBER"
     context: str = "personal"  # "personal" | "team"
     current: Optional[CurrentSubscription] = None
-    tiers: tuple[SubscriptionTier, ...] = ()
     portal_url: Optional[str] = None
     # When the fetch failed (vs cleanly not-logged-in), the message for the surface.
     error: Optional[str] = None
@@ -99,37 +85,6 @@ class SubscriptionState:
 # =============================================================================
 # Payload parsing
 # =============================================================================
-
-
-def _coalesce(*vals: Any) -> Any:
-    """First non-None value (None-coalesce, NOT truthy-coalesce — keeps 0/0.0).
-
-    NAS sends 0 for the free tier's dollarsPerMonth/tierOrder; a bare ``a or b``
-    would treat that 0 as missing and fall through to the alias (yielding a '—'
-    price or a corrupted sort index).
-    """
-    for v in vals:
-        if v is not None:
-            return v
-    return None
-
-
-def _parse_tier(raw: Any) -> Optional[SubscriptionTier]:
-    if not isinstance(raw, dict):
-        return None
-    tier_id = raw.get("tierId") or raw.get("id")
-    name = raw.get("name")
-    if not (isinstance(tier_id, str) and isinstance(name, str)):
-        return None
-    return SubscriptionTier(
-        tier_id=tier_id,
-        name=name,
-        tier_order=int(_coalesce(raw.get("tierOrder"), raw.get("order"), 0)),
-        dollars_per_month=parse_money(_coalesce(raw.get("dollarsPerMonth"), raw.get("priceUsd"))),
-        monthly_credits=parse_money(raw.get("monthlyCredits")),
-        is_current=bool(raw.get("isCurrent")),
-        is_enabled=bool(raw.get("isEnabled", True)),
-    )
 
 
 def _parse_current(raw: Any) -> Optional[CurrentSubscription]:
@@ -161,12 +116,6 @@ def subscription_state_from_payload(
     raw_org = payload.get("org")
     org: dict[str, Any] = raw_org if isinstance(raw_org, dict) else {}
 
-    tiers: list[SubscriptionTier] = []
-    for item in payload.get("tiers") or ():
-        parsed = _parse_tier(item)
-        if parsed is not None:
-            tiers.append(parsed)
-
     raw_context = payload.get("context")
     context = raw_context if raw_context in ("personal", "team") else "personal"
 
@@ -177,7 +126,6 @@ def subscription_state_from_payload(
         role=org.get("role"),
         context=context,
         current=_parse_current(payload.get("current")),
-        tiers=tuple(tiers),
         portal_url=portal_url,
     )
 
@@ -270,27 +218,6 @@ def subscription_manage_url(state: SubscriptionState) -> Optional[str]:
 _DEV_FIXTURE_PORTAL = "https://portal.nousresearch.com/billing"
 
 
-def _dev_tiers(current_id: Optional[str]) -> tuple[SubscriptionTier, ...]:
-    specs = [
-        ("free", "Free", 0, Decimal("0"), Decimal("0")),
-        ("plus", "Plus", 1, Decimal("20"), Decimal("1000")),
-        ("super", "Super", 2, Decimal("50"), Decimal("3000")),
-        ("ultra", "Ultra", 3, Decimal("99"), Decimal("7000")),
-    ]
-    return tuple(
-        SubscriptionTier(
-            tier_id=tid,
-            name=name,
-            tier_order=order,
-            dollars_per_month=price,
-            monthly_credits=credits,
-            is_current=(tid == current_id),
-            is_enabled=True,
-        )
-        for tid, name, order, price, credits in specs
-    )
-
-
 def _dev_current(**over: Any) -> CurrentSubscription:
     base: dict[str, Any] = dict(
         tier_id="plus",
@@ -323,42 +250,31 @@ def dev_fixture_subscription_state() -> Optional[SubscriptionState]:
     if name in ("logged-out", "logged_out", "loggedout"):
         return SubscriptionState(logged_in=False)
     if name == "free":
-        return SubscriptionState(logged_in=True, current=None, tiers=_dev_tiers(None), **common)
+        return SubscriptionState(logged_in=True, current=None, **common)
     if name in ("mid", "mid-tier"):
-        return SubscriptionState(logged_in=True, current=_dev_current(), tiers=_dev_tiers("plus"), **common)
+        return SubscriptionState(logged_in=True, current=_dev_current(), **common)
     if name in ("top", "top-tier"):
         return SubscriptionState(
             logged_in=True,
             current=_dev_current(tier_id="ultra", tier_name="Ultra", monthly_credits=Decimal("7000"), credits_remaining=Decimal("5000")),
-            tiers=_dev_tiers("ultra"),
             **common,
         )
     if name in ("not-admin", "member"):
-        return SubscriptionState(
-            logged_in=True,
-            current=_dev_current(),
-            tiers=_dev_tiers("plus"),
-            org_name="Acme Inc",
-            org_id="org_acme",
-            role="MEMBER",
-            portal_url=_DEV_FIXTURE_PORTAL,
-        )
+        return SubscriptionState(logged_in=True, current=_dev_current(), **{**common, "role": "MEMBER"})
     if name == "downgrade":
         return SubscriptionState(
             logged_in=True,
             current=_dev_current(tier_id="super", tier_name="Super", monthly_credits=Decimal("3000"), credits_remaining=Decimal("1500"), pending_downgrade_tier_name="Plus", pending_downgrade_at="2026-07-15"),
-            tiers=_dev_tiers("super"),
             **common,
         )
     if name == "cancel":
         return SubscriptionState(
             logged_in=True,
             current=_dev_current(cancel_at_period_end=True, cancellation_effective_at="2026-07-01"),
-            tiers=_dev_tiers("plus"),
             **common,
         )
     if name == "team":
-        return SubscriptionState(logged_in=True, context="team", current=None, tiers=(), org_name="Acme Engineering", org_id="org_eng", role="OWNER", portal_url=_DEV_FIXTURE_PORTAL)
+        return SubscriptionState(logged_in=True, context="team", current=None, org_name="Acme Engineering", org_id="org_eng", role="OWNER", portal_url=_DEV_FIXTURE_PORTAL)
 
     # Unknown name → behave as logged-out so the misconfiguration is visible.
     return SubscriptionState(logged_in=False, error=f"unknown HERMES_DEV_SUBSCRIPTION_FIXTURE: {name}")

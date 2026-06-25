@@ -5,11 +5,9 @@ import type { SubscriptionOverlayState } from '../app/interfaces.js'
 import type { SubscriptionStateResponse } from '../gatewayTypes.js'
 import type { Theme } from '../theme.js'
 
-import { ActionRow, footer, MenuRow, UsageBars } from './overlayPrimitives.js'
+import { footer, MenuRow, UsageBars } from './overlayPrimitives.js'
 
 interface SubscriptionOverlayProps {
-  /** Replace the overlay slot (screen transitions + pending data). */
-  onPatch: (next: Partial<SubscriptionOverlayState>) => void
   /** Close the overlay entirely. */
   onClose: () => void
   overlay: SubscriptionOverlayState
@@ -17,40 +15,21 @@ interface SubscriptionOverlayProps {
 }
 
 /**
- * The /subscription modal — deep-link only, NEVER charges in-terminal.
- * Mirrors billingOverlay.tsx's structure: a pure-render state machine
- * (overview → confirm → handoff) where all RPCs live in subscription.ts and
- * are reached through `overlay.ctx`. No step-up here: changing a plan is a
- * browser deep-link, which needs no billing scope (the scope gate is on
- * /topup's charge, where the resumable step-up lives).
+ * The /subscription modal — deep-link only, NEVER charges in-terminal. A single
+ * overview screen (plan + usage) that hands off to the portal in the browser to
+ * change the plan: no in-terminal picker, no step-up (the scope gate lives on
+ * /topup's charge). All RPCs live in subscription.ts, reached via `overlay.ctx`.
  */
-export function SubscriptionOverlay({ onClose, onPatch, overlay, t }: SubscriptionOverlayProps) {
-  const { ctx, screen, state: s } = overlay
-
-  // Team context: no tier picker — teams run on shared credits; redirect to /topup.
-  if (s.context === 'team') {
-    return (
-      <Box borderColor={t.color.accent} borderStyle="round" flexDirection="column" paddingX={1}>
-        <TeamContextScreen onClose={onClose} s={s} t={t} />
-      </Box>
-    )
-  }
+export function SubscriptionOverlay({ onClose, overlay, t }: SubscriptionOverlayProps) {
+  const { ctx, state: s } = overlay
 
   return (
     <Box borderColor={t.color.accent} borderStyle="round" flexDirection="column" paddingX={1}>
-      {screen === 'overview' && <OverviewScreen ctx={ctx} onClose={onClose} onPatch={onPatch} s={s} t={t} />}
-      {screen === 'confirm' && (
-        <ConfirmScreen
-          ctx={ctx}
-          onBack={() => onPatch({ screen: 'overview' })}
-          onClose={onClose}
-          onPatch={onPatch}
-          overlay={overlay}
-          s={s}
-          t={t}
-        />
+      {s.context === 'team' ? (
+        <TeamContextScreen onClose={onClose} s={s} t={t} />
+      ) : (
+        <OverviewScreen ctx={ctx} onClose={onClose} s={s} t={t} />
       )}
-      {screen === 'handoff' && <HandoffScreen onClose={onClose} t={t} />}
     </Box>
   )
 }
@@ -60,7 +39,6 @@ export function SubscriptionOverlay({ onClose, onPatch, overlay, t }: Subscripti
 interface ScreenProps {
   ctx: SubscriptionOverlayState['ctx']
   onClose: () => void
-  onPatch: (next: Partial<SubscriptionOverlayState>) => void
   s: SubscriptionStateResponse
   t: Theme
 }
@@ -99,6 +77,7 @@ function OverviewScreen({ ctx, onClose, s, t }: ScreenProps) {
   // (Past-due/dunning was removed from the NAS read — a card-failing
   // subscriber now returns as a normal plan; no special-casing here.)
   const cancelOn = c?.cancellation_effective_display ?? c?.cancellation_effective_at
+
   const cancellationNote = isCancelScheduled
     ? cancelOn
       ? `Cancels on ${cancelOn} — your plan stays active until then.`
@@ -107,6 +86,7 @@ function OverviewScreen({ ctx, onClose, s, t }: ScreenProps) {
 
   const downgradeOn =
     c?.pending_downgrade_display ?? c?.pending_downgrade_at ?? 'the end of the billing period'
+
   const downgradeNote =
     !isCancelScheduled && hasPendingDowngrade
       ? `Scheduled to switch to ${c?.pending_downgrade_tier_name} on ${downgradeOn}.`
@@ -251,119 +231,6 @@ function TeamContextScreen({ onClose, s, t }: TeamContextScreenProps) {
 
       <Text />
       {footer('Enter/Esc close', t)}
-    </Box>
-  )
-}
-
-// ── Screen: Confirm (y/n deep-link, NO in-terminal charge) ───────────
-
-interface ConfirmScreenProps extends ScreenProps {
-  onBack: () => void
-  onPatch: (next: Partial<SubscriptionOverlayState>) => void
-  overlay: SubscriptionOverlayState
-}
-
-function ConfirmScreen({ ctx, onBack, onClose, onPatch, overlay, s, t }: ConfirmScreenProps) {
-  const targetTierId = overlay.pendingTargetTierId ?? undefined
-  const targetTier = s.tiers.find(tier => tier.tier_id === targetTierId)
-  const isUpgrade = !s.current?.tier_id
-
-  const [sel, setSel] = useState(0)
-  const items = ['Continue to your subscription page', 'Cancel']
-  const [transitioned, setTransitioned] = useState(false)
-
-  const confirm = () => {
-    if (transitioned) {
-      return
-    }
-
-    setTransitioned(true)
-    onPatch({ screen: 'handoff' })
-
-    void ctx.openManageLink().then(ok => {
-      if (!ok) {
-        // openManageLink only fails if the portal URL can't be built or the
-        // browser won't open — return to overview (it sys()'d the reason).
-        onPatch({ screen: 'overview' })
-      }
-    })
-  }
-
-  const choose = (i: number) => {
-    if (i === 0) {
-      return confirm()
-    }
-
-    return onBack()
-  }
-
-  useInput((ch, key) => {
-    if (key.escape) {
-      return onBack()
-    }
-
-    if (key.upArrow && sel > 0) {
-      setSel(v => v - 1)
-    }
-
-    if (key.downArrow && sel < items.length - 1) {
-      setSel(v => v + 1)
-    }
-
-    if (key.return) {
-      return choose(sel)
-    }
-
-    if (ch === 'y') {
-      return choose(0)
-    }
-
-    if (ch === 'n') {
-      return choose(1)
-    }
-  })
-
-  return (
-    <Box flexDirection="column">
-      <Text bold color={t.color.accent}>
-        {isUpgrade ? 'Confirm subscription' : 'Confirm plan change'}
-      </Text>
-      {targetTier && (
-        <Text color={t.color.text}>
-          {targetTier.name} · {targetTier.dollars_per_month_display}/mo
-        </Text>
-      )}
-      <Text color={t.color.muted}>You'll finish this change securely on your subscription page in your browser.</Text>
-
-      <Text />
-      {items.map((label, i) => (
-        <ActionRow active={sel === i} color={i === 0 ? t.color.ok : undefined} key={label} label={label} t={t} />
-      ))}
-
-      <Text />
-      {footer('y/Enter confirm · n/Esc cancel', t)}
-    </Box>
-  )
-}
-
-// ── Screen: Handoff (transient) ──────────────────────────────────────
-
-function HandoffScreen({ onClose, t }: { onClose: () => void; t: Theme }) {
-  useInput((_ch, key) => {
-    if (key.escape) {
-      return onClose()
-    }
-  })
-
-  return (
-    <Box flexDirection="column">
-      <Text bold color={t.color.accent}>
-        Opening your subscription page…
-      </Text>
-      <Text color={t.color.muted}>Opening your subscription page in the browser…</Text>
-      <Text color={t.color.muted}>Finish on the page that just opened. Re-run /subscription to see the change.</Text>
-      <Text />
-      {footer('Esc close', t)}
     </Box>
   )
 }

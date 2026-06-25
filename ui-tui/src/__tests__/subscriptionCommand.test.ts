@@ -19,7 +19,6 @@ const loggedInState = (overrides: Partial<SubscriptionStateResponse> = {}): Subs
   org_name: 'Acme',
   role: 'OWNER',
   current: null,
-  tiers: [],
   portal_url: 'https://portal.nousresearch.com/billing',
   ...overrides
 })
@@ -71,7 +70,7 @@ describe('/subscription slash command', () => {
 
   it('fetches subscription.state and opens the overlay', async () => {
     const { run } = buildCtx({
-      'subscription.state': loggedInState({ tiers: [{ tier_id: 'pro', name: 'Pro', tier_order: 1, dollars_per_month_display: '$20', monthly_credits: '1000', is_current: false, is_enabled: true }] })
+      'subscription.state': loggedInState()
     })
 
     await run('')
@@ -80,7 +79,6 @@ describe('/subscription slash command', () => {
 
     expect(overlay).not.toBeNull()
     expect(overlay?.screen).toBe('overview')
-    expect(overlay?.state.tiers).toHaveLength(1)
   })
 
   it('shows portal-login sys line when not logged in', async () => {

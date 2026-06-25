@@ -152,10 +152,9 @@ export interface BillingOverlayState {
 
 // ── Subscription overlay (deep-link only, NEVER charges in-terminal) ──
 
-export type SubscriptionScreen =
-  | 'overview'      // shows plan + usage bar + tier list (states a–e collapse into this)
-  | 'confirm'       // y/n confirm before opening the manage-subscription URL
-  | 'handoff'       // transient: "Opening your subscription page in your browser…"
+// Deep-link only: the overview hands off to the portal in the browser; there is
+// no in-terminal plan picker, so there is exactly one screen.
+export type SubscriptionScreen = 'overview'
 
 export interface SubscriptionOverlayCtx {
   /** Build {portal}/manage-subscription?org_id=… locally and open it. Resolves ok/false. */
@@ -170,8 +169,6 @@ export interface SubscriptionOverlayState {
   ctx: SubscriptionOverlayCtx
   screen: SubscriptionScreen
   state: SubscriptionStateResponse
-  /** The tier the user selected on the overview, summarized on the confirm screen. */
-  pendingTargetTierId?: string | null
 }
 
 export interface OverlayState {

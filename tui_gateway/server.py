@@ -5663,7 +5663,6 @@ def _(rid, params: dict) -> dict:
 
 def _serialize_subscription_state(state) -> dict:
     """Serialize a SubscriptionState for the wire (Decimals → strings)."""
-    from agent.billing_view import format_money
     from agent.billing_usage import format_renews
 
     def _s(value):
@@ -5685,17 +5684,6 @@ def _serialize_subscription_state(state) -> dict:
             "cancellation_effective_at": c.cancellation_effective_at,
             "cancellation_effective_display": format_renews(c.cancellation_effective_at),
         }
-    tiers = []
-    for t in state.tiers:
-        tiers.append({
-            "tier_id": t.tier_id,
-            "name": t.name,
-            "tier_order": t.tier_order,
-            "dollars_per_month_display": format_money(t.dollars_per_month),
-            "monthly_credits": _s(t.monthly_credits),
-            "is_current": t.is_current,
-            "is_enabled": t.is_enabled,
-        })
     return {
         "ok": True,
         "logged_in": state.logged_in,
@@ -5706,7 +5694,6 @@ def _serialize_subscription_state(state) -> dict:
         "role": state.role,
         "context": state.context,
         "current": current,
-        "tiers": tiers,
         "portal_url": state.portal_url,
         "error": state.error,
         # Shared dollar usage model (two-bar view) embedded so /subscription

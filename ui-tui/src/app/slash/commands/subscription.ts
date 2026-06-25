@@ -103,7 +103,6 @@ export const subscriptionCommands: SlashCommand[] = [
             patchOverlayState({
               subscription: {
                 ctx: buildSubscriptionCtx(ctx, sys, s),
-                pendingTargetTierId: null,
                 screen: 'overview',
                 state: s
               }

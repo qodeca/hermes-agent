@@ -141,16 +141,6 @@ export interface BillingMutationResponse {
   retry_after?: number | null
 }
 
-export interface SubscriptionTierOption {
-  tier_id: string
-  name: string
-  tier_order: number
-  dollars_per_month_display: string
-  monthly_credits: string
-  is_current: boolean
-  is_enabled: boolean        // false = grandfathered current tier
-}
-
 export interface SubscriptionStateResponse {
   ok: boolean
   logged_in: boolean
@@ -173,7 +163,6 @@ export interface SubscriptionStateResponse {
     cancellation_effective_at: string | null  // ISO when cancellation takes effect
     cancellation_effective_display: string | null  // formatted cancellation_effective_at
   } | null
-  tiers: SubscriptionTierOption[]
   portal_url: string | null
   error?: string | null
   // Shared dollar usage model (two-bar view), embedded by the gateway so the
