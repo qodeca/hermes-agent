@@ -28,13 +28,14 @@ headless auto-login session after reboot.
 
 ## Status
 
-**Done (automated):** rate-limit fix committed on `main`; `config.yaml` hardened
-(`destructive_slash_confirm: true`, `dashboard.trusted_proxy: false`); launcher / watchdog /
-deploy scripts written; dashboard + watchdog + keep-awake plists written and lint-clean;
-keep-awake and watchdog loaded; SPA pre-built; `ripgrep` installed.
+**Live now:** Tailscale up (`100.73.147.36`); rate-limit fix committed on `main` and verified
+end-to-end (429 despite rotating XFF); `config.yaml` hardened (`destructive_slash_confirm: true`,
+`dashboard.trusted_proxy: false`); dashboard **running on the tailnet with basic-auth**
+(`/login`→200, unauth API→401); oMLX key **rotated** (old key now 401); keep-awake + watchdog
+loaded; SPA pre-built; `ripgrep` installed. Watchdog sees oMLX + dashboard healthy.
 
-**Pending (your steps):** Tailscale, FileVault/auto-login, gateway tokens, dashboard
-password, oMLX key rotation, Telegram alert chat id — then load the dashboard.
+**Pending (your steps):** gateway tokens (`hermes gateway setup`); FileVault off + auto-login;
+Telegram alert chat id (`watchdog.telegram_chat_id` in config.yaml).
 
 ## Runbook — remaining manual steps
 
