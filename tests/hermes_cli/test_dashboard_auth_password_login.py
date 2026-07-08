@@ -441,3 +441,44 @@ class TestLoginPageRender:
             assert "<script>" in html
         finally:
             clear_providers()
+
+
+# ---------------------------------------------------------------------------
+# Regression: a lone password provider must not hit the OAuth auto-SSO path
+# ---------------------------------------------------------------------------
+
+
+class TestSinglePasswordProviderNoAutoSSO:
+    """A single password provider has no OAuth redirect to auto-initiate.
+
+    Regression for the 500 on ``/auth/login?provider=<pw>``:
+      * the gate's single-provider auto-SSO used to redirect to
+        ``/auth/login?provider=<name>``, whose ``start_login()`` raises
+        ``NotImplementedError`` for a password provider → 500;
+      * hitting ``/auth/login`` directly did the same.
+    Both must route to the ``/login`` credential form instead.
+    """
+
+    def test_unauth_html_load_redirects_to_login_not_auth_login(self, gated_app):
+        r = gated_app.get("/", follow_redirects=False)
+        assert r.status_code == 302
+        loc = r.headers["location"]
+        assert "/login" in loc
+        assert "/auth/login" not in loc
+
+    def test_auth_login_for_password_provider_redirects_not_500(self, gated_app):
+        r = gated_app.get(
+            "/auth/login?provider=testpw", follow_redirects=False
+        )
+        assert r.status_code == 302
+        assert "/login" in r.headers["location"]
+        assert "/auth/login" not in r.headers["location"]
+
+    def test_auth_login_password_provider_preserves_next(self, gated_app):
+        r = gated_app.get(
+            "/auth/login?provider=testpw&next=%2Fchat", follow_redirects=False
+        )
+        assert r.status_code == 302
+        # next is validated + carried into the /login interstitial
+        assert "next=" in r.headers["location"]
+        assert "chat" in r.headers["location"]

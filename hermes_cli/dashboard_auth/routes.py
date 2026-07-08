@@ -195,6 +195,19 @@ async def auth_login(request: Request, provider: str, next: str = ""):
             detail=f"Provider does not support interactive login: {provider!r}",
         )
 
+    if getattr(p, "supports_password", False):
+        # Password providers have no OAuth redirect to initiate; their sign-in
+        # is the credential form served by /login. start_login() raises for
+        # them, so send the user to /login instead of 500ing — this also makes
+        # a stale bookmark to /auth/login?provider=<pw> land on the form.
+        from urllib.parse import quote
+
+        target = _validate_post_login_target(next)
+        url = f"{_prefix(request)}/login"
+        if target:
+            url = f"{url}?next={quote(target, safe='')}"
+        return RedirectResponse(url=url, status_code=302)
+
     try:
         ls = p.start_login(redirect_uri=_redirect_uri(request))
     except ProviderError as e:
