@@ -910,6 +910,31 @@ Validation rejects values without `http://` / `https://` scheme, without a host,
 
 > **Note:** `public_url` overrides the OAuth callback URL only. The `Secure` cookie flag is still controlled by `request.url.scheme` (X-Forwarded-Proto under proxy_headers), so an `http://` `public_url` on a TLS-terminated public deploy will produce non-Secure cookies. This is an operator footgun — pair `public_url` with proper TLS termination upstream.
 
+### Loopback bind behind a trusted proxy
+
+When a TLS-terminating reverse proxy (for example [Tailscale](https://tailscale.com/) Serve, nginx, or Caddy) fronts the dashboard and forwards to a loopback bind, two settings make that work without exposing a plain-HTTP port:
+
+| Setting (`config.yaml`) | Effect |
+|---|---|
+| `dashboard.trusted_proxy: true` | Trust `X-Forwarded-For` for the login rate limiter's client IP, and force the auth gate on for a loopback bind so `proxy_headers` is enabled (X-Forwarded-Proto → `Secure` cookies). Leave it `false` on a direct bind, where the header is client-controlled and trusting it would let a caller vary it per request to evade the rate limit. |
+| `dashboard.allowed_hosts: [<host>, …]` | Extra `Host` values the DNS-rebinding guard accepts. A loopback bind otherwise rejects the proxy's public Host (for example `<node>.<tailnet>.ts.net`). List each hostname the proxy forwards — the guard still rejects everything else. |
+
+Example — Tailscale Serve terminating TLS in front of a loopback dashboard:
+
+```yaml
+dashboard:
+  trusted_proxy: true
+  allowed_hosts:
+    - my-box.my-tailnet.ts.net
+```
+
+```bash
+hermes dashboard --host 127.0.0.1 --port 9119   # bind loopback
+tailscale serve --bg 9119                        # HTTPS at https://my-box.my-tailnet.ts.net
+```
+
+This keeps the dashboard off the tailnet interface directly (only the proxy reaches it), preserves the Host-header rebinding guard, and yields `Secure` session cookies over the proxy's TLS. It is a stronger alternative to binding `--host <tailscale-ip>` directly over plain HTTP.
+
 ### OAuth flow
 
 The provider implements the [Nous Portal OAuth contract v1](https://github.com/NousResearch/nous-account-service/blob/main/docs/agent-dashboard-oauth-contract.md) — authorization-code grant with PKCE (S256):
