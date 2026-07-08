@@ -437,6 +437,13 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
         host_only = h.rsplit(":", 1)[0] if ":" in h else h
     host_only = host_only.lower()
 
+    # Operator-declared extra hosts (e.g. the *.ts.net name when fronted by
+    # Tailscale Serve, or a reverse-proxy hostname). Lets a loopback bind
+    # accept the specific proxied Host without opening up to 0.0.0.0.
+    allowed = getattr(app.state, "allowed_hosts", None)
+    if allowed and host_only in allowed:
+        return True
+
     # 0.0.0.0 bind means operator explicitly opted into all-interfaces
     # (requires --insecure per web_server.start_server). No Host-layer
     # defence can protect that mode; rely on operator network controls.
@@ -16687,6 +16694,24 @@ def start_server(
     # banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_auth(host)
 
+    # A loopback bind normally means "local only" → gate off. But when fronted
+    # by a trusted reverse proxy (dashboard.trusted_proxy — e.g. Tailscale
+    # Serve terminating TLS and forwarding to 127.0.0.1), the dashboard is
+    # actually reachable through that proxy. Force the full auth gate on and
+    # let uvicorn honor X-Forwarded-* (so proxy_headers is enabled below →
+    # request.url.scheme reflects X-Forwarded-Proto → Secure session cookies,
+    # and the login rate limiter keys on the real X-Forwarded-For client).
+    if not app.state.auth_required:
+        try:
+            from hermes_cli.config import cfg_get, load_config_readonly
+
+            if cfg_get(
+                load_config_readonly(), "dashboard", "trusted_proxy", default=False
+            ):
+                app.state.auth_required = True
+        except Exception:
+            pass
+
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
     # dashboards). If a caller still passes it, warn that it is now a no-op
@@ -16759,6 +16784,23 @@ def start_server(
     # Record the bound host so host_header_middleware can validate incoming
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
     app.state.bound_host = host
+
+    # Extra Host values to accept beyond the bound interface — for a loopback
+    # bind fronted by a trusted reverse proxy (Tailscale Serve, nginx) that
+    # forwards the original public Host. Keeps the rebinding guard narrow
+    # (only these names pass) instead of resorting to a 0.0.0.0 bind.
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        _allowed = (
+            cfg_get(load_config_readonly(), "dashboard", "allowed_hosts", default=[])
+            or []
+        )
+        app.state.allowed_hosts = {
+            str(h).strip().lower() for h in _allowed if str(h).strip()
+        }
+    except Exception:
+        app.state.allowed_hosts = set()
 
     # ── Start uvicorn with direct Server API ─────────────────────────
     # We use uvicorn.Server directly (not uvicorn.run) so we can split

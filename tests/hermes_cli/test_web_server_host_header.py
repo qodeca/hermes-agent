@@ -215,3 +215,38 @@ class TestWebSocketHostOriginGuard:
             },
         ):
             pass
+
+
+class TestAllowedHostsAllowlist:
+    """dashboard.allowed_hosts lets a loopback bind accept a specific proxied
+    Host (e.g. the *.ts.net name behind Tailscale Serve) without opening to
+    0.0.0.0 — while still rejecting everything else (rebinding stays blocked).
+    """
+
+    @pytest.fixture
+    def allowlisted(self):
+        from hermes_cli import web_server
+
+        prev = getattr(web_server.app.state, "allowed_hosts", None)
+        web_server.app.state.allowed_hosts = {"box.example.ts.net"}
+        yield
+        if prev is None:
+            try:
+                del web_server.app.state.allowed_hosts
+            except AttributeError:
+                pass
+        else:
+            web_server.app.state.allowed_hosts = prev
+
+    def test_loopback_accepts_allowlisted_host(self, allowlisted):
+        from hermes_cli.web_server import _is_accepted_host
+
+        assert _is_accepted_host("box.example.ts.net", "127.0.0.1")
+        assert _is_accepted_host("box.example.ts.net:443", "127.0.0.1")
+        assert _is_accepted_host("BOX.example.TS.net", "127.0.0.1")  # case-insensitive
+
+    def test_non_allowlisted_still_rejected(self, allowlisted):
+        from hermes_cli.web_server import _is_accepted_host
+
+        assert not _is_accepted_host("evil.example", "127.0.0.1")
+        assert not _is_accepted_host("other.ts.net", "127.0.0.1")
