@@ -81,10 +81,12 @@ def clear_token_routes() -> None:
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
+    # Delegates to the shared trusted-proxy-aware resolver so audit logs
+    # never key on a spoofable X-Forwarded-For unless dashboard.trusted_proxy
+    # is set. See client_ip.py.
+    from hermes_cli.dashboard_auth.client_ip import client_ip
+
+    return client_ip(request)
 
 
 def extract_bearer_token(request: Request) -> str:
