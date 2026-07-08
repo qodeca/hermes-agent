@@ -141,34 +141,6 @@ export function GatewaySettings() {
     setCloudOrgState(value)
   }
 
-  // Hermes Cloud is beta-gated: the selector ModeCard only appears when the main
-  // process reports the BETA env flag is enabled. Default hidden until the async
-  // check resolves, so it never flashes in for non-beta users.
-  const [cloudBetaEnabled, setCloudBetaEnabled] = useState(false)
-  useEffect(() => {
-    const desktop = window.hermesDesktop
-
-    if (!desktop?.cloud?.betaEnabled) {
-      return
-    }
-
-    let cancelled = false
-    desktop.cloud
-      .betaEnabled()
-      .then(enabled => {
-        if (!cancelled) {
-          setCloudBetaEnabled(Boolean(enabled))
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setCloudBetaEnabled(false)
-        }
-      })
-
-    return () => void (cancelled = true)
-  }, [])
-
   // Connection scope: null = the global/default connection (the original
   // behavior); a profile name = that profile's per-profile remote override, so
   // each profile can point at its own backend.
@@ -773,7 +745,7 @@ export function GatewaySettings() {
         </div>
       ) : null}
 
-      <div className={cn('grid gap-3', cloudBetaEnabled ? 'sm:grid-cols-3' : 'sm:grid-cols-2')}>
+      <div className="grid gap-3 sm:grid-cols-3">
         <ModeCard
           active={state.mode === 'local'}
           description={g.localDesc}
@@ -782,16 +754,14 @@ export function GatewaySettings() {
           onSelect={() => setState(current => ({ ...current, mode: 'local' }))}
           title={g.localTitle}
         />
-        {cloudBetaEnabled ? (
-          <ModeCard
-            active={state.mode === 'cloud'}
-            description={g.cloudDesc}
-            disabled={state.envOverride}
-            icon={Cloud}
-            onSelect={() => setState(current => ({ ...current, mode: 'cloud' }))}
-            title={g.cloudTitle}
-          />
-        ) : null}
+        <ModeCard
+          active={state.mode === 'cloud'}
+          description={g.cloudDesc}
+          disabled={state.envOverride}
+          icon={Cloud}
+          onSelect={() => setState(current => ({ ...current, mode: 'cloud' }))}
+          title={g.cloudTitle}
+        />
         <ModeCard
           active={state.mode === 'remote'}
           description={g.remoteDesc}

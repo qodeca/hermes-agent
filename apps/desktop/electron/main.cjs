@@ -6628,17 +6628,6 @@ ipcMain.handle('hermes:cloud:status', async () => ({
   portalBaseUrl: resolvePortalBaseUrl(),
   signedIn: await hasLivePortalSession()
 }))
-
-// Whether the Hermes Cloud gateway selector is enabled — gated behind a BETA
-// env flag while the feature is in beta. Truthy values: '1', 'true', 'yes',
-// 'on' (case-insensitive). Absent, empty, 'false', '0', etc. → disabled, so the
-// renderer hides the Cloud ModeCard entirely.
-function betaFeaturesEnabled() {
-  const raw = String(process.env.BETA ?? '').trim().toLowerCase()
-  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
-}
-
-ipcMain.handle('hermes:cloud:beta-enabled', async () => betaFeaturesEnabled())
 ipcMain.handle('hermes:cloud:login', async () => {
   await openPortalLoginWindow()
   return { ok: true, signedIn: await hasLivePortalSession() }
