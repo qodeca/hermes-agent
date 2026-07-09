@@ -43,6 +43,26 @@
 }
 
 /* ------------------------------------------------------------------ */
+/* Cascadia Mono — vendored from qodeca/erfana (SIL OFL, see            */
+/* fonts-terminal/Cascadia-LICENSE.txt). Used as the embedded-terminal  */
+/* font for the "readable" theme (theme.terminalFont), matching erfana. */
+/* ------------------------------------------------------------------ */
+@font-face {
+  font-family: 'Cascadia Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts-terminal/CascadiaMono-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Cascadia Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts-terminal/CascadiaMono-Bold.woff2') format('woff2');
+}
+
+/* ------------------------------------------------------------------ */
 /* Hermes Agent — Nous DS with the LENS_0 (Hermes teal) palette applied
    statically as the default dashboard theme. */
 /* ------------------------------------------------------------------ */

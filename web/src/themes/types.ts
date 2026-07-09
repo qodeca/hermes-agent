@@ -183,6 +183,12 @@ export interface DashboardTheme {
   /** Default text/cursor color for the embedded terminal pane (xterm.js).
    *  Hex string. Defaults to `"#f0e6d2"` when absent. */
   terminalForeground?: string;
+  /** CSS font-family stack for the embedded xterm terminals (chat + Hermes
+   *  console). Read directly by ChatPage / HermesConsoleModal via
+   *  `useTheme()`. Defaults to the bundled JetBrains Mono stack when absent;
+   *  the `readable` theme sets Cascadia Mono to match qodeca/erfana. Must be a
+   *  monospace stack — xterm renders a fixed character grid. */
+  terminalFont?: string;
 }
 
 /**

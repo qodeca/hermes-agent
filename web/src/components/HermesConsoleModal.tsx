@@ -12,7 +12,7 @@ import { useModalBehavior } from "@/hooks/useModalBehavior";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { api } from "@/lib/api";
 import { cn, themedBody } from "@/lib/utils";
-import { useTheme } from "@/themes";
+import { useTheme, DEFAULT_TERMINAL_FONT } from "@/themes";
 
 type ConsoleFrame =
   | {
@@ -349,8 +349,9 @@ export function HermesConsoleModal({ open, onClose }: HermesConsoleModalProps) {
     const term = new XtermTerminal({
       allowProposedApi: true,
       cursorBlink: true,
-      fontFamily:
-        "'JetBrains Mono', 'Cascadia Mono', 'Fira Code', 'MesloLGS NF', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
+      // Theme may override the terminal font (readable → Cascadia Mono); falls
+      // back to the shared JetBrains Mono stack. Must stay monospace.
+      fontFamily: theme.terminalFont?.trim() || DEFAULT_TERMINAL_FONT,
       fontSize: 13,
       lineHeight: 1.25,
       letterSpacing: 0,

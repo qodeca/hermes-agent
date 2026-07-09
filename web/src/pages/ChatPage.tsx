@@ -37,7 +37,7 @@ import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { PluginSlot } from "@/plugins";
-import { useTheme } from "@/themes";
+import { useTheme, DEFAULT_TERMINAL_FONT } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
 
 // Stable per-browser token identifying THIS chat tab's keep-alive PTY session.
@@ -410,8 +410,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const term = new Terminal({
       allowProposedApi: true,
       cursorBlink: true,
-      fontFamily:
-        "'JetBrains Mono', 'Cascadia Mono', 'Fira Code', 'MesloLGS NF', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
+      fontFamily: theme.terminalFont?.trim() || DEFAULT_TERMINAL_FONT,
       fontSize: terminalFontSizeForWidth(tierW0),
       lineHeight: terminalLineHeightForWidth(tierW0),
       letterSpacing: 0,
@@ -910,6 +909,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         reconnectTimerRef.current = null;
       }
     };
+    // `theme.terminalFont` and `terminalTheme` are intentionally NOT deps:
+    // recreating the Terminal here would tear down the live PTY WebSocket and
+    // lose all scrollback. They are live-synced in the dedicated effects below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [channel, clearReconnectTimer, resumeParam, scopedProfile, reconnectNonce]);
 
   // When the user returns to the chat tab (isActive: false → true), the
@@ -964,6 +967,20 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     if (!term) return;
     term.options.theme = terminalTheme;
   }, [terminalTheme]);
+
+  // Keep the live xterm font in sync when the active theme's `terminalFont`
+  // changes mid-session (mirrors the color sync above). We mutate the option
+  // and refit rather than recreating the Terminal — the font changes the
+  // character-cell metrics, so a refit recomputes rows/cols.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    const next = theme.terminalFont?.trim() || DEFAULT_TERMINAL_FONT;
+    if (term.options.fontFamily !== next) {
+      term.options.fontFamily = next;
+      syncMetricsRef.current?.();
+    }
+  }, [theme.terminalFont]);
 
   // Layout:
   //   outer flex column — sits inside the dashboard's content area
