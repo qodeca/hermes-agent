@@ -6,6 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `AGENTS.md` is the full, canonical development guide (~70KB). It covers the contribution rubric, the "footprint ladder" for adding capability, plugin/skill authoring, profiles, cron, and dozens of hard-won gotchas. **Read the relevant section of `AGENTS.md` before non-trivial work** — this file is only the fast index.
 
+## Fork-specific docs (Qodeca)
+
+This is the `qodeca/hermes-agent` fork. Two docs cover fork-only setup — read them for anything touching the live server or the fork's GitHub state:
+
+- `docs/hermes-server-setup.md` — running this checkout as an always-on server (launchd dashboard + gateway, Tailscale Serve HTTPS, deploy/restart discipline).
+- `docs/qodeca-fork-github-config.md` — fork relationship, the upstream-sync procedure, and fork CI state (enabled but dormant — verify locally).
+
 ## Two invariants that govern almost every change
 
 1. **Per-conversation prompt caching is sacred.** A long-lived conversation reuses a cached prefix every turn. Anything that mutates past context, swaps toolsets, or rebuilds the system prompt mid-conversation invalidates that cache and multiplies user cost. The system prompt must be byte-stable for the life of a conversation. The one exception is context compression.

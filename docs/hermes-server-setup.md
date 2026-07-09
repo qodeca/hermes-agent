@@ -2,7 +2,7 @@
 
 > **Audience:** Qodeca maintainer running Hermes as an always-on server on this Mac
 > **Scope:** Qodeca-specific runtime setup, not part of upstream Hermes docs
-> **Last updated:** 2026-07-08
+> **Last updated:** 2026-07-09
 
 Turns this MacBook into an always-on Hermes server that **runs from the fork source**
 (`~/Projects/hermes-agent`, editable install, branch `main`). Surfaces: Telegram + Slack
@@ -118,6 +118,19 @@ The server runs from the live working tree with **no auto-reload**. After editin
 ```
 It refuses to restart if the code doesn't import (broken edit / unresolved merge markers),
 so a bad save can't crash-loop the services.
+
+> **Gotcha — the dashboard must be launchd-owned for a restart to land.** `hermes-deploy.sh`
+> (and any bare `launchctl kickstart -k … ai.hermes.dashboard`) restarts the *launchd-managed*
+> dashboard. If a dashboard was started **manually** (`hermes dashboard …` from a shell), that
+> process holds `127.0.0.1:9119` outside launchd, so kickstart's new instance fails to bind
+> (`address already in use`) and the **stale process keeps serving old code** — while the deploy
+> still prints "✓ dashboard kickstarted". Before deploying, free the port first, then kickstart:
+> ```bash
+> hermes dashboard --stop                                   # kills any manual instance on 9119
+> launchctl kickstart -k gui/$(id -u)/ai.hermes.dashboard   # start the managed one
+> ```
+> Then confirm the restart actually took — the PID must change: `pgrep -f 'hermes dashboard'`.
+> An unchanged PID (or a long `ps -o etime`) means old code is still live.
 
 **Upstream merges:** stop the services first (`hermes gateway stop`), merge
 `upstream/main`, resolve fully, run `hermes-deploy.sh`. Never merge into the live tree
