@@ -39,10 +39,15 @@ headless auto-login session after reboot.
 exposure; `__Host-…; Secure` session cookies; login verified). `config.yaml` hardened
 (`destructive_slash_confirm: true`, `dashboard.trusted_proxy: true`, `allowed_hosts`); rate-limit
 fix verified over HTTPS; oMLX key **rotated**; keep-awake + watchdog loaded; watchdog sees oMLX +
-dashboard healthy.
+dashboard healthy. **Telegram gateway** installed as a launchd service
+(`ai.hermes.gateway.plist`) and running (polling mode; Marcin paired; default-deny for unknown
+senders). Agent identity is the `SOUL.md` persona **Marian Kowalski** (AI Executive Assistant),
+with Google Workspace + shared-Chrome access on the default profile.
 
-**Pending (your steps):** gateway tokens (`hermes gateway setup`); FileVault off + auto-login;
-Telegram alert chat id (`watchdog.telegram_chat_id` in config.yaml).
+**Pending (your steps):** FileVault off + auto-login (so the launchd Chrome + gateway reload after
+reboot); Telegram `/sethome` to set the home channel for cron results and alerts; Slack tokens if
+wanted (`hermes gateway setup`); watchdog Telegram alert chat id (`watchdog.telegram_chat_id` in
+config.yaml).
 
 ## HTTPS via Tailscale Serve
 
@@ -158,6 +163,39 @@ be opened by one process at a time; per-channel launching would collide.
 - **Manage:** `launchctl kickstart -k gui/$(id -u)/ai.hermes.chrome` (restart),
   `launchctl bootout gui/$(id -u)/ai.hermes.chrome` (stop). `curl -s http://127.0.0.1:9222/json/version`
   confirms it's up. Verify a channel sees it: `hermes mcp test chrome_devtools`.
+
+## Google Workspace access (marian.kowalski@qodeca.com)
+
+Hermes has full Gmail/Calendar/Drive/Docs/Sheets/Contacts access to the dedicated agent
+account via the bundled `google-workspace` skill (OAuth "Desktop app" flow, not an MCP). The
+same access is available on every channel and inherited by subagents.
+
+- **OAuth app:** Internal app in a Cloud project owned by the qodeca.com org
+  (`marian-kowalski-hermes-agent`). Internal audience is what makes the token long-lived and
+  skips Google's verification of the restricted Gmail/Drive scopes – do not switch it to
+  External. Client type: Desktop.
+- **Credentials on disk (mode 600):** `~/.hermes/google_client_secret.json` (the OAuth client)
+  and `~/.hermes/google_token.json` (the refreshable user token). The token is a bearer
+  credential – treat it like a password.
+- **Scopes:** full read + write – `gmail.readonly`, `gmail.send`, `gmail.modify`, `calendar`,
+  `drive`, `contacts.readonly`, `spreadsheets`, `documents`. The skill's own rule requires
+  confirmation before any send/delete/share.
+- **Runtime deps on all surfaces:** the skill runs `python <skill>/scripts/google_api.py`.
+  Interactive CLI resolves `python` to pyenv (3.13.x); launchd surfaces resolve it to the
+  hermes-dev venv (`~/.hermes/venvs/hermes-dev/bin/python`, 3.11) because that dir is first on
+  their PATH. Both interpreters have the Google client libs installed, so the skill works
+  everywhere. If a `brew`/pyenv change breaks one, reinstall with
+  `python <skill>/scripts/setup.py --install-deps`.
+- **Accepted risk (lethal trifecta):** every channel can read the inbox (untrusted content)
+  and send mail / share Drive (exfiltration path). This is intentional here; the confirm-before-
+  send rule is the main guardrail, and a reachable Telegram/Slack bot is the exposure to watch.
+- **Re-auth / setup:** `GS=~/.hermes/skills/productivity/google-workspace/scripts/setup.py`;
+  `python $GS --auth-url` → approve while signed in as marian (the shared `:9222` Chrome is that
+  session) → `python $GS --auth-code "<redirect-url>"` → `python $GS --check`. Verify the bound
+  account with a Gmail `getProfile` call – it must return `marian.kowalski@qodeca.com`.
+- **Revoke:** `python $GS --revoke`, or Admin console → Security → API controls, or delete the
+  token file. **Changing marian's account password also revokes the token** (Gmail scopes) and
+  forces a re-auth.
 
 ## Security posture
 
