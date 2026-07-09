@@ -228,9 +228,65 @@ export const defaultLargeTheme: DashboardTheme = {
   },
 };
 
+/**
+ * High-legibility opt-in theme. Same Hermes Teal palette as ``defaultTheme``,
+ * but built for comfortable reading rather than the branded look:
+ *
+ *   - Inter for both body and display text (larger 17px root size, looser
+ *     line-height).
+ *   - ``customCSS`` reaches the two things ``typography`` alone can't: it
+ *     replaces the design-system's decorative display faces (Mondwest / Rules
+ *     Compressed / Rules Expanded) with the theme font on tabs/badges/
+ *     segmented controls, and neutralises the ``.text-display`` brand style
+ *     (forced UPPERCASE + wide tracking) so chrome renders in normal case.
+ *
+ * The overrides are ``!important`` on purpose: they intentionally win over the
+ * vendored ``@nous-research/ui`` cascade (whose utilities live in a Tailwind
+ * layer). customCSS is scoped — ThemeProvider tears it down on theme switch,
+ * so the branded look returns when the user selects another theme.
+ */
+export const readableTheme: DashboardTheme = {
+  name: "readable",
+  label: "Readable",
+  description: "High-legibility Inter, larger text, no decorative fonts",
+  palette: defaultTheme.palette,
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: `"Inter", ${SYSTEM_SANS}`,
+    fontDisplay: `"Inter", ${SYSTEM_SANS}`,
+    // JetBrains Mono is bundled via @font-face in index.css — no fontUrl needed.
+    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`,
+    fontUrl:
+      "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap",
+    baseSize: "17px",
+    lineHeight: "1.6",
+  },
+  layout: DEFAULT_LAYOUT,
+  terminalBackground: defaultTheme.terminalBackground,
+  customCSS: `
+/* Replace the design-system's decorative display faces with the theme font so
+   tabs, badges, segmented controls and titles render in Inter. */
+:root {
+  --font-rules-compressed: var(--theme-font-sans) !important;
+  --font-rules-expanded: var(--theme-font-sans) !important;
+  --font-mondwest: var(--theme-font-sans) !important;
+  --font-sans: var(--theme-font-sans) !important;
+}
+/* Neutralise the brand display style: no forced uppercase, no wide letter-
+   spacing on chrome. Every wide-tracking chrome element (tabs, buttons,
+   badges, titles) also carries .text-display, so this one rule also relaxes
+   the inline tracking-[0.1em]/[0.2em] utilities on those same elements. */
+.text-display {
+  text-transform: none !important;
+  letter-spacing: normal !important;
+}
+`,
+};
+
 export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
   default: defaultTheme,
   "default-large": defaultLargeTheme,
+  readable: readableTheme,
   "nous-blue": nousBlueTheme,
   midnight: midnightTheme,
   ember: emberTheme,
