@@ -21,6 +21,12 @@ const SYSTEM_SANS =
 const SYSTEM_MONO =
   'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace';
 
+/** Default xterm terminal font stack, used when a theme leaves `terminalFont`
+ *  unset. Shared by ChatPage + HermesConsoleModal so the two never drift; the
+ *  `readable` theme overrides it with Cascadia Mono. Must stay monospace. */
+export const DEFAULT_TERMINAL_FONT =
+  "'JetBrains Mono', 'Cascadia Mono', 'Fira Code', 'MesloLGS NF', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace";
+
 const DEFAULT_TYPOGRAPHY: ThemeTypography = {
   fontSans: SYSTEM_SANS,
   fontMono: SYSTEM_MONO,
@@ -228,9 +234,104 @@ export const defaultLargeTheme: DashboardTheme = {
   },
 };
 
+/** Native system-sans stack, mirrored from qodeca/erfana's ``--font-sans``
+ *  (design-tokens.css) so the ``readable`` theme matches erfana's UI font. */
+const ERFANA_SANS =
+  "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', " +
+  "'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif";
+
+/** Cascadia Mono stack, mirrored from erfana's ``--font-mono``. Used only for
+ *  the embedded terminals (via ``terminalFont``); the woff2 is bundled +
+ *  @font-face'd in index.css (see fonts-terminal/Cascadia-LICENSE.txt). */
+const ERFANA_MONO =
+  "'Cascadia Mono', 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', " +
+  "Consolas, 'Courier New', monospace";
+
+/**
+ * High-legibility opt-in theme. Same Hermes Teal palette as ``defaultTheme``,
+ * but aligned with qodeca/erfana's typography — exactly two fonts UI-wide:
+ *
+ *   - **System sans** (erfana's ``--font-sans``) for body, display AND "mono"
+ *     CSS contexts. Setting ``fontMono`` to the sans stack flips every CSS mono
+ *     consumer — ``code``/``pre``/``kbd``/``samp``, the ``font-mono`` utility
+ *     and ``.font-mono-ui`` — to system sans, so the UI proper carries no
+ *     monospace typeface (per the "no mono in the UI except the terminal" rule).
+ *   - **Cascadia Mono** (erfana's ``--font-mono``) for the embedded xterm
+ *     terminals only, via ``terminalFont`` — ChatPage / HermesConsoleModal read
+ *     it through ``useTheme()``. A terminal grid requires a monospace font.
+ *   - ``customCSS`` replaces the design-system's decorative display faces
+ *     (Mondwest / Rules Compressed / Rules Expanded) and the ``.font-courier``
+ *     utility with the theme sans, removes ALL custom letter-spacing UI-wide,
+ *     keeps sidebar items normal-case, and tightens sidebar spacing.
+ *
+ * The overrides are ``!important`` on purpose: they intentionally win over the
+ * vendored ``@nous-research/ui`` cascade (whose utilities live in a Tailwind
+ * layer). customCSS is scoped — ThemeProvider tears it down on theme switch,
+ * so the default look returns when the user selects another theme.
+ */
+export const readableTheme: DashboardTheme = {
+  name: "readable",
+  label: "Readable",
+  description: "System sans + Cascadia Mono terminals — matches erfana",
+  palette: defaultTheme.palette,
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: ERFANA_SANS,
+    fontDisplay: ERFANA_SANS,
+    // "mono" is also the system sans: flips code/pre/kbd/samp + the font-mono
+    // utility and .font-mono-ui off monospace, so the UI proper carries no
+    // mono. The one mono (Cascadia) lives only in the terminals (terminalFont).
+    fontMono: ERFANA_SANS,
+    // No fontUrl — system fonts need no webfont fetch.
+    // Root size stays at the default 15px.
+  },
+  layout: DEFAULT_LAYOUT,
+  terminalBackground: defaultTheme.terminalBackground,
+  // The one mono font, used only by the embedded xterm terminals.
+  terminalFont: ERFANA_MONO,
+  customCSS: `
+/* Replace the design-system's decorative display faces with the theme font so
+   tabs, badges, segmented controls and titles render in the theme's system
+   sans. */
+:root {
+  --font-rules-compressed: var(--theme-font-sans) !important;
+  --font-rules-expanded: var(--theme-font-sans) !important;
+  --font-mondwest: var(--theme-font-sans) !important;
+  --font-sans: var(--theme-font-sans) !important;
+  /* Also flip the DS mono var — some design-system components (e.g. chart
+     axis labels) read raw var(--font-mono). --theme-font-mono is the system
+     sans here, so this keeps "no monospace in the UI" true, not incidental. */
+  --font-mono: var(--theme-font-mono) !important;
+}
+/* The .font-courier utility hardcodes 'Courier New' first, so it ignores
+   --theme-font-mono — override it directly to the theme sans. */
+.font-courier {
+  font-family: var(--theme-font-sans) !important;
+}
+/* Remove ALL custom letter-spacing across the entire UI. Every tracking-*
+   utility, the DS .text-display 0.05em, and any per-theme letterSpacing token
+   set letter-spacing on specific elements; a universal !important reset beats
+   them all (letter-spacing is purely cosmetic, so this is safe). The xterm
+   terminals render to canvas and are unaffected. */
+* {
+  letter-spacing: normal !important;
+}
+/* Sidebar nav items: keep them normal case (they carry an explicit \`uppercase\`
+   utility on top of .text-display) and tighten the vertical spacing between
+   items. The list has no row gap, so each link's vertical padding (py-2.5 =
+   0.625rem) is the inter-item gap — halve it. */
+#app-sidebar nav a {
+  text-transform: none !important;
+  padding-top: 0.3rem !important;
+  padding-bottom: 0.3rem !important;
+}
+`,
+};
+
 export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
   default: defaultTheme,
   "default-large": defaultLargeTheme,
+  readable: readableTheme,
   "nous-blue": nousBlueTheme,
   midnight: midnightTheme,
   ember: emberTheme,
