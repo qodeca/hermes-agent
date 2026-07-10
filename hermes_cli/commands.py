@@ -1166,11 +1166,11 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
 #   - allowlist: `/allowlist show` ops/debugging surface; reached via
-#     /hermes allowlist show on Slack. Added at the registry's 50-command
-#     ceiling (T22) — exempting the new, low-frequency command here (rather
-#     than letting the clamp silently bump an existing native slash, e.g.
-#     /version) is the documented way to add a command once the registry is
-#     already at the cap.
+#     /hermes allowlist show on Slack. Added once the registry was already
+#     at the 50-command ceiling — exempting the new, low-frequency command
+#     here (rather than letting the clamp silently bump an existing native
+#     slash, e.g. /version) is the documented way to add a command once the
+#     registry is already at the cap.
 _SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug", "allowlist"})
 
 

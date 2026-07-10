@@ -518,7 +518,7 @@ class CLICommandsMixin:
     def _handle_allowlist_command(self, cmd_original: str) -> None:
         """Handle ``/allowlist show`` — print the effective authorization sources.
 
-        Finding #29: the owner himself was denied after a restart and had no
+        The owner himself was denied after a restart and had no
         way to answer "why was I denied?" without reading code. Prints the
         same env allowlists / allow-all flags / pairing grants that
         ``GatewayAuthorizationMixin._is_user_authorized`` actually consults —

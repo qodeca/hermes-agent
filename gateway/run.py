@@ -10711,8 +10711,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     reply_is_unverified = not self._is_user_authorized(reply_source)
                 except Exception:
+                    # Fail closed, not open: if the authz check itself
+                    # crashes, treat the quoted author as unverified rather
+                    # than silently rendering the quote as a verified/plain
+                    # pointer. The failure mode that matters here is a
+                    # stranger's injected content reaching the LLM
+                    # unlabeled -- demoting on error costs nothing (the
+                    # pointer still renders, just tagged) while fail-open
+                    # would defeat the whole mitigation on any transient
+                    # authz-path exception.
                     logger.debug("reply-to author authorization check failed", exc_info=True)
-                    reply_is_unverified = False
+                    reply_is_unverified = True
             if getattr(event, "reply_to_is_own_message", False):
                 message_text = (
                     f'[Replying to your previous message: "{reply_snippet}"]\n\n'

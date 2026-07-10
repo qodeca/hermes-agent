@@ -1,4 +1,4 @@
-"""Tests for the CLI /allowlist show command (finding #29 — T22).
+"""Tests for the CLI /allowlist show command.
 
 The owner himself was denied after a restart with no way to answer "why was
 I denied?" without reading code. ``/allowlist show`` surfaces the effective
