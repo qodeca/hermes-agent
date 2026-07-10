@@ -78,6 +78,19 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+# Wrap-up instruction delivered on the session-output-budget grace call.
+# Appended to the NEWEST tool result (never a synthetic user message):
+# that message was created this very iteration, so the cached prompt
+# prefix is untouched and role alternation is preserved — the same
+# channel the mid-turn /steer marker uses.
+OUTPUT_BUDGET_WRAP_UP_NOTE = (
+    "\n\n[HERMES SYSTEM NOTICE — not tool output]\n"
+    "The session's output-token budget has been reached. This is the final "
+    "model call for this turn: reply with a concise summary of what was "
+    "accomplished and anything left incomplete. Do not call any more tools.\n"
+    "[/HERMES SYSTEM NOTICE]"
+)
+
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
@@ -621,6 +634,9 @@ def run_conversation(
     # one.  Threshold comes from config ``agent.max_consecutive_api_failures``
     # (0 = disabled).
     consecutive_api_failures = 0
+    # Session output-token budget grace tracking: True once the model has
+    # been granted its one wrap-up call after the budget tripped.
+    output_budget_grace_granted = False
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
@@ -655,7 +671,51 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
-        
+
+        # Session output-token budget: bounds the total VOLUME of model
+        # output a session may generate — neither max_iterations (tool-call
+        # count) nor the failure breaker does this, so a looping model can
+        # burn unbounded output inside its allowed iterations (observed:
+        # 261 KB of self-deliberation for a two-word answer).  Checked here,
+        # before any message is appended, so a break always leaves the
+        # transcript on a complete assistant(+tool) turn — role alternation
+        # preserved.  On the first trip the model gets ONE grace call (the
+        # pre-existing _budget_grace_call mechanism: a free iteration that
+        # skips iteration_budget.consume() below) to produce a final
+        # summary; the wrap-up instruction rides the newest tool result,
+        # steer-style.  0 = unlimited.
+        _output_budget = getattr(agent, "_session_output_token_budget", 0) or 0
+        if _output_budget > 0 and agent.session_output_tokens >= _output_budget:
+            if output_budget_grace_granted:
+                _turn_exit_reason = "output_budget_exhausted"
+                if not agent.quiet_mode:
+                    agent._safe_print(
+                        f"\n⚠️  Session output-token budget exhausted "
+                        f"({agent.session_output_tokens:,}/{_output_budget:,} output tokens)"
+                    )
+                break
+            output_budget_grace_granted = True
+            agent._budget_grace_call = True
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n⚠️  Session output-token budget reached "
+                    f"({agent.session_output_tokens:,}/{_output_budget:,} output tokens) "
+                    "— requesting final summary..."
+                )
+            # Deliver the wrap-up instruction on the newest tool result —
+            # it was appended this turn (not yet part of any cached
+            # prefix), and tool→assistant keeps strict role alternation.
+            # When the tail isn't a tool result (budget already exhausted
+            # at turn start), skip the nudge: the grace call simply
+            # answers the pending user message directly.
+            if (
+                messages
+                and isinstance(messages[-1], dict)
+                and messages[-1].get("role") == "tool"
+                and isinstance(messages[-1].get("content"), str)
+            ):
+                messages[-1]["content"] += OUTPUT_BUDGET_WRAP_UP_NOTE
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")

@@ -1516,6 +1516,22 @@ def init_agent(
         _breaker_limit = 10
     agent._max_consecutive_api_failures = _breaker_limit
 
+    # Session output-token budget: total model output tokens a session may
+    # generate before the conversation loop stops it (with one grace call
+    # for a final summary).  Bounds output VOLUME, which neither
+    # max_iterations (tool-call count) nor the breaker (failures) does —
+    # a looping model can burn unbounded output inside its allowed
+    # iterations.  0 = unlimited (the default).  Cron sessions may lower
+    # this via cron.session_output_token_budget (applied by the scheduler
+    # only when this agent-level key is unset).
+    try:
+        _raw_output_budget = _agent_section.get("session_output_token_budget", 0)
+        _output_budget = int(_raw_output_budget)
+        _output_budget = max(_output_budget, 0)  # negative → unlimited
+    except (TypeError, ValueError):
+        _output_budget = 0
+    agent._session_output_token_budget = _output_budget
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)
@@ -1645,6 +1661,18 @@ def init_agent(
                     f"  Falling back to provider default.\n",
                     file=sys.stderr,
                 )
+    # Last-resort default per-call output cap: applied only when neither
+    # the constructor arg nor model.max_tokens set one.  A FIXED cap sent
+    # on every call via the existing _max_tokens_param plumbing — never
+    # derived from a remaining session budget (a shrinking cap produces
+    # truncated/empty responses).  0 = provider default (no cap sent).
+    if agent.max_tokens is None:
+        try:
+            _default_max_tokens = int(_agent_section.get("default_max_tokens", 0))
+        except (TypeError, ValueError):
+            _default_max_tokens = 0
+        if _default_max_tokens > 0:
+            agent.max_tokens = _default_max_tokens
     agent._session_init_model_config["max_tokens"] = agent.max_tokens
 
     # Read explicit context_length override from model config

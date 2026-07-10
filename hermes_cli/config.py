@@ -1015,6 +1015,24 @@ DEFAULT_CONFIG = {
         # this threshold aborts at the threshold before trying them all;
         # raise the knob if you run large pools.  0 = disabled.
         "max_consecutive_api_failures": 10,
+        # Session output-token budget: total model OUTPUT tokens a session
+        # may generate before the loop stops it (a runaway self-deliberation
+        # loop once produced 261 KB of output for a two-word answer).  When
+        # the budget is first exceeded the model gets ONE grace call to
+        # produce a final summary, then the turn ends with exit reason
+        # "output_budget_exhausted".  Checked at a turn boundary, so the
+        # transcript always ends on a complete assistant(+tool) turn.
+        # Cron sessions have their own lower default
+        # (cron.session_output_token_budget) that applies only when this
+        # key is unset.  0 = unlimited.
+        "session_output_token_budget": 0,
+        # Default per-call output-token cap, applied only when no explicit
+        # max_tokens is set (constructor arg or model.max_tokens).  A FIXED
+        # cap sent on every API call via the provider-correct kwarg
+        # (max_tokens / max_completion_tokens) — it never shrinks with the
+        # remaining session budget, since a shrinking cap produces
+        # truncated/empty responses.  0 = provider default (no cap sent).
+        "default_max_tokens": 0,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
@@ -2711,6 +2729,14 @@ DEFAULT_CONFIG = {
         # negative disables the cap (unlimited — the inactivity timeout is
         # then the only bound). Default 3600 (1 hour).
         "max_runtime_seconds": 3600,
+        # Session output-token budget for CRON sessions — a lower default
+        # than interactive sessions because a runaway scheduled job burns
+        # unattended (an incident: 261 KB of looping self-deliberation for
+        # a two-word answer).  Applies only when the agent-level
+        # agent.session_output_token_budget key is UNSET in config.yaml;
+        # an explicit agent-level value (including 0 = unlimited) always
+        # wins.  0 = unlimited.  Default 200000 output tokens.
+        "session_output_token_budget": 200000,
     },
 
     # Kanban multi-agent coordination — controls the dispatcher loop that

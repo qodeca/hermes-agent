@@ -301,6 +301,46 @@ def _is_cron_silence_response(text: str) -> bool:
         return True
     return False
 
+
+_DEFAULT_CRON_OUTPUT_TOKEN_BUDGET = 200000
+
+
+def _resolve_cron_session_output_budget(cfg: dict | None) -> int | None:
+    """Resolve the session output-token budget for a cron job's agent.
+
+    Cron sessions default to a LOWER budget than interactive sessions
+    (``cron.session_output_token_budget``, default 200000) because a
+    runaway scheduled job burns unattended — an incident produced 261 KB
+    of looping self-deliberation for a two-word answer.
+
+    Precedence: an agent-level ``agent.session_output_token_budget`` key
+    present in config.yaml always wins — including an explicit 0
+    (= unlimited) — and agent init already applied it, so this returns
+    ``None`` ("leave the agent's value alone"). Otherwise returns the
+    cron budget to set on the agent: ``cron.session_output_token_budget``
+    when configured (clamped at >= 0; 0 = unlimited), else the default.
+    An invalid configured value falls back to the default rather than
+    raising, mirroring ``_resolve_cron_max_runtime``.
+    """
+    _agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+    if isinstance(_agent_cfg, dict) and "session_output_token_budget" in _agent_cfg:
+        return None
+
+    _cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    _cron_cfg = _cron_cfg if isinstance(_cron_cfg, dict) else {}
+    _configured = _cron_cfg.get("session_output_token_budget")
+    if _configured is None:
+        return _DEFAULT_CRON_OUTPUT_TOKEN_BUDGET
+    try:
+        return max(int(_configured), 0)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid cron.session_output_token_budget=%r in config; using default %d",
+            _configured, _DEFAULT_CRON_OUTPUT_TOKEN_BUDGET,
+        )
+        return _DEFAULT_CRON_OUTPUT_TOKEN_BUDGET
+
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
@@ -3100,6 +3140,13 @@ def run_job(
         # Max iterations
         max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
 
+        # Session output-token budget: cron sessions get a lower default
+        # than interactive ones (an unattended runaway job once produced
+        # 261 KB of looping self-deliberation for a two-word answer).
+        # None = the user set the agent-level key; agent init already
+        # applied it and it must win (including an explicit 0 = unlimited).
+        _cron_output_budget = _resolve_cron_session_output_budget(_cfg)
+
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
 
@@ -3277,7 +3324,13 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
+        # Apply the cron session output-token budget resolved above (None
+        # means the user's agent-level key governs and is already on the
+        # agent from config).
+        if _cron_output_budget is not None:
+            agent._session_output_token_budget = _cron_output_budget
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured

@@ -3038,6 +3038,13 @@ class AIAgent:
                 + "the per-turn iteration/cost budget was exhausted before a "
                 "final answer. Send `continue` to keep going."
             )
+        if reason == "output_budget_exhausted":
+            return (
+                prefix
+                + "the session's output-token budget was exhausted before a "
+                "final answer. Raise `agent.session_output_token_budget` "
+                "(0 = unlimited) or start a new session."
+            )
         if reason == "ollama_runtime_context_too_small":
             return (
                 prefix
