@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+from datetime import datetime
 import subprocess
 import sys
 import threading
@@ -245,6 +246,10 @@ from cron.jobs import (
     advance_next_run,
     claim_dispatch,
     _resolve_cron_max_runtime,
+    list_jobs,
+    _machine_id,
+    _run_claim_ttl_seconds,
+    _ensure_aware,
 )
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -400,6 +405,163 @@ def _consume_interrupted_flag(job_id: str) -> bool:
             _interrupted_job_ids.discard(job_id)
             return True
         return False
+
+
+# ---------------------------------------------------------------------------
+# T3: startup reconciliation of orphaned runs (findings 2, 22).
+#
+# mark_running_jobs_interrupted above handles the GRACEFUL shutdown path —
+# in-memory job ids, force-killed tool subprocesses, still able to run
+# mark_job_run before the process exits. A SIGKILL/OOM/hard crash bypasses
+# that path entirely: the process never gets to run its shutdown hook, so a
+# recurring job's durable running_marker (T2) or a one-shot's run_claim
+# (#59229) can be left stamped in jobs.json with no process left alive to
+# clear it — the run vanishes (last_run_at stays null, or the job is later
+# silently removed with no recorded error). reconcile_orphaned_runs() is the
+# durable-state complement, run ONCE at scheduler startup before the first
+# tick (InProcessCronScheduler.start()).
+# ---------------------------------------------------------------------------
+
+_RECONCILE_ERROR = "interrupted: scheduler restarted mid-run"
+
+
+def _stamp_is_reapable(
+    stamp: dict, now: datetime, ttl_seconds: float, own_machine_id: str,
+) -> bool:
+    """Whether a running_marker/run_claim timestamp may be reaped at startup.
+
+    Reapable when EITHER:
+      - it is stamped with this process's own ``_machine_id()`` — a
+        same-machine restart means whatever fired it is gone (this process
+        IS the restart), or
+      - it is older than the run-claim TTL (``_run_claim_ttl_seconds`` — the
+        same staleness bound ``_get_due_jobs_locked`` already uses for
+        one-shot run_claim recovery): the claiming tick died mid-run.
+
+    A FRESH marker/claim from a FOREIGN machine-id is left untouched. The
+    gateway and desktop app may both run in-process tickers against one
+    HERMES_HOME (cron/jobs.py, #59229) — a fresh foreign stamp means a run is
+    legitimately in flight in that other process right now.
+
+    KNOWN LIMITATION (accepted trade-off from design review): ``_machine_id()``
+    identifies the machine/user, not the process — two processes on the same
+    machine (e.g. gateway + desktop) share it. So a same-machine gateway
+    restart can reap a live desktop run's marker (or vice versa) at boot.
+    There is no cheap way to tell "my previous incarnation died" from "my
+    sibling process on this machine is still running" without a per-process
+    id that would itself need to survive the crash to be checked against —
+    which defeats the purpose. Accepted for now; a future revision could add
+    a process-scoped lease if this proves to matter in practice.
+    """
+    if stamp.get("by") == own_machine_id:
+        return True
+    try:
+        stamped_at = _ensure_aware(datetime.fromisoformat(stamp["at"]))
+    except Exception:
+        return True  # malformed timestamp: treat as abandoned, reap it
+    age = (now - stamped_at).total_seconds()
+    return age >= ttl_seconds
+
+
+def _send_reconcile_alert(job_id: str, job_name: str, reason: str) -> None:
+    """Emit one operator alert per job reconciled at startup.
+
+    Guarded import: ``hermes_cli.operator_alerts.send_operator_alert`` does
+    not exist yet — it ships in a later slice of this workstream (T16). Until
+    then this degrades to a plain ``logger.warning`` so the reconciliation is
+    still visible in ``errors.log`` / ``hermes logs``. Once T16 lands, this
+    starts routing through the real operator-alert channel with NO code
+    change here — only the import stops raising ``ImportError``.
+    """
+    message = (
+        f"Cron job '{job_name}' ({job_id}) was interrupted mid-run and "
+        f"reconciled at scheduler startup: {reason}"
+    )
+    try:
+        # T16 has not shipped yet — this module does not exist in the
+        # current tree. ty (correctly) flags the reference; suppressed
+        # deliberately so the guarded import can land ahead of T16.
+        from hermes_cli.operator_alerts import send_operator_alert  # type: ignore[unresolved-import]
+    except ImportError:
+        logger.warning(message)
+        return
+    try:
+        send_operator_alert(message)
+    except Exception as e:
+        logger.warning("%s (alert delivery failed: %s)", message, e)
+
+
+def reconcile_orphaned_runs() -> list:
+    """Reconcile cron runs orphaned by a hard process death (T3, findings 2, 22).
+
+    Called once by ``InProcessCronScheduler.start()`` before the first tick.
+    Scans every stored job (including disabled ones — a job paused mid-run
+    still deserves its orphaned state cleared) for two independent kinds of
+    stale in-flight marker:
+
+    1. Recurring jobs (``running_marker``, T2): always reconciled once
+       reapable (see ``_stamp_is_reapable``). The marker carries no due-skip
+       semantics, so clearing it via ``mark_job_run`` and recording
+       ``last_status="error"`` cannot interfere with the job's next
+       legitimate fire.
+
+    2. One-shot jobs (``run_claim``, ``schedule.kind == "once"``):
+       ``_get_due_jobs_locked`` already has its OWN stale-claim recovery — a
+       run_claim older than the TTL is simply allowed through and the job is
+       re-dispatched (up to ``repeat.times`` attempts, the #59229
+       at-most-times guard). Reconciling those here too would FIGHT that
+       logic: calling ``mark_job_run`` stamps ``last_run_at``, which makes
+       ``compute_next_run`` for a "once" schedule return ``None`` and
+       permanently disables the job — burning its remaining retry budget
+       without ever attempting it.
+
+       So a one-shot orphan is reconciled ONLY when its retry budget is
+       already exhausted (``repeat.completed >= repeat.times``) — exactly the
+       case where ``_get_due_jobs_locked``'s "dispatch limit reached" branch
+       would otherwise silently pop the job from jobs.json with no recorded
+       error and no operator alert (the T2-reviewer finding this closes).
+       One-shots that still have retry budget left are deliberately skipped
+       here; the due-scan's existing recovery is the correct and sufficient
+       path for those, and reconciling them early would prematurely
+       terminate a job that was still entitled to retry.
+
+    Returns the list of reconciled job ids (for callers/tests to inspect).
+    """
+    own_machine_id = _machine_id()
+    ttl_seconds = _run_claim_ttl_seconds()
+    now = _hermes_now()
+
+    reconciled: list = []
+    for job in list_jobs(include_disabled=True):
+        job_id = job.get("id")
+        if not job_id:
+            continue
+        job_name = job.get("name") or job_id
+
+        marker = job.get("running_marker")
+        if marker and _stamp_is_reapable(marker, now, ttl_seconds, own_machine_id):
+            mark_job_run(job_id, False, _RECONCILE_ERROR)
+            _send_reconcile_alert(job_id, job_name, _RECONCILE_ERROR)
+            reconciled.append(job_id)
+            continue  # a job carries at most one of the two markers
+
+        claim = job.get("run_claim")
+        if (
+            claim
+            and job.get("schedule", {}).get("kind") == "once"
+            and _stamp_is_reapable(claim, now, ttl_seconds, own_machine_id)
+        ):
+            repeat = job.get("repeat") or {}
+            times = repeat.get("times")
+            completed = repeat.get("completed", 0)
+            if times is not None and times > 0 and completed >= times:
+                mark_job_run(job_id, False, _RECONCILE_ERROR)
+                _send_reconcile_alert(job_id, job_name, _RECONCILE_ERROR)
+                reconciled.append(job_id)
+            # else: retry budget remains — leave for get_due_jobs()' own
+            # stale-claim recovery at the next tick (see docstring above).
+
+    return reconciled
 
 
 # Sequential (env-mutating) cron jobs — workdir jobs that touch

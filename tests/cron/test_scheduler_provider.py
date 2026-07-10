@@ -15,6 +15,14 @@ Both call `cron.scheduler.tick(...)` on a loop and exit when their stop_event
 is set. We patch `cron.scheduler.tick` (both tickers import it locally as
 `cron_tick`, so the module-attribute patch is observed) and assert the loop
 drives it and stops promptly.
+
+Every test that drives ``start()`` (directly or via the two ticker entry
+points above) also patches ``cron.scheduler.reconcile_orphaned_runs`` — T3
+wired ``start()`` to call it once before the loop, and without a stub it
+would hit the real (frozen-at-import) cron storage path via
+``InProcessCronScheduler.reconcile()``, which is exactly what these tests
+must never do. Dedicated reconciliation behavior is covered by
+tests/cron/test_startup_reconciliation.py.
 """
 import threading
 import time
@@ -51,7 +59,8 @@ def test_ticker_calls_tick_at_least_once_then_stops():
         calls.append(kwargs)
         return 0
 
-    with patch("cron.scheduler.tick", side_effect=fake_tick):
+    with patch("cron.scheduler.tick", side_effect=fake_tick), \
+         patch("cron.scheduler.reconcile_orphaned_runs", return_value=[]):
         # interval=0 keeps the loop tight; stop after the first observed tick.
         t = threading.Thread(
             target=_start_cron_ticker,
@@ -84,7 +93,8 @@ def test_desktop_ticker_calls_tick_then_stops():
         calls.append(kwargs)
         return 0
 
-    with patch("cron.scheduler.tick", side_effect=fake_tick):
+    with patch("cron.scheduler.tick", side_effect=fake_tick), \
+         patch("cron.scheduler.reconcile_orphaned_runs", return_value=[]):
         t = threading.Thread(
             target=_start_desktop_cron_ticker,
             args=(stop,),
@@ -157,7 +167,8 @@ def test_inprocess_provider_ticks_and_stops():
     prov = InProcessCronScheduler()
     assert prov.name == "builtin"
 
-    with patch("cron.scheduler.tick", side_effect=lambda *a, **k: calls.append(k) or 0):
+    with patch("cron.scheduler.tick", side_effect=lambda *a, **k: calls.append(k) or 0), \
+         patch("cron.scheduler.reconcile_orphaned_runs", return_value=[]):
         t = threading.Thread(
             target=prov.start, args=(stop,), kwargs={"interval": 0}, daemon=True
         )
@@ -318,16 +329,44 @@ def test_hooks_did_not_change_required_surface():
     assert set(CronScheduler.__abstractmethods__) == {"name", "start"}
 
 
-def test_builtin_inherits_hook_defaults():
-    """The built-in inherits no-op defaults for the new hooks (it never needs
-    to override them)."""
+def test_builtin_inherits_on_jobs_changed_default():
+    """The built-in inherits the no-op on_jobs_changed default (it re-reads
+    jobs.json on every tick, so it never needs to override it)."""
     from cron.scheduler_provider import InProcessCronScheduler
 
     p = InProcessCronScheduler()
     assert p.on_jobs_changed() is None
-    assert p.reconcile() is None
     # built-in does not override fire_due; it simply isn't called for built-in.
     assert hasattr(p, "fire_due")
+
+
+def test_builtin_reconcile_runs_orphan_reconciliation(tmp_path, monkeypatch):
+    """T3: unlike on_jobs_changed, the built-in DOES override reconcile() — it
+    calls cron.scheduler.reconcile_orphaned_runs() and swallows any error so a
+    reconciliation bug can never block the ticker from starting. Hermetic:
+    points cron storage at a temp dir with no jobs, so this never touches the
+    real ~/.hermes/cron."""
+    import cron.jobs as jobs
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    assert InProcessCronScheduler().reconcile() is None
+
+
+def test_builtin_reconcile_swallows_errors(monkeypatch):
+    """A reconciliation failure must not propagate out of reconcile() —
+    start() calls it unconditionally before the tick loop."""
+    from cron.scheduler_provider import InProcessCronScheduler
+    import cron.scheduler as sched
+
+    monkeypatch.setattr(
+        sched, "reconcile_orphaned_runs",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert InProcessCronScheduler().reconcile() is None
 
 
 def test_fire_due_default_claims_then_runs(monkeypatch):
@@ -396,6 +435,7 @@ def test_ticker_survives_baseexception_from_tick():
     stop = threading.Event()
     prov = InProcessCronScheduler()
     with patch("cron.scheduler.tick", side_effect=_boom), \
+         patch("cron.scheduler.reconcile_orphaned_runs", return_value=[]), \
          patch("cron.jobs.record_ticker_heartbeat"):
         t = threading.Thread(target=prov.start, args=(stop,), kwargs={"interval": 0}, daemon=True)
         t.start()
@@ -418,6 +458,7 @@ def test_ticker_records_heartbeat_each_iteration():
     stop = threading.Event()
     prov = InProcessCronScheduler()
     with patch("cron.scheduler.tick", side_effect=lambda *a, **k: 0), \
+         patch("cron.scheduler.reconcile_orphaned_runs", return_value=[]), \
          patch("cron.jobs.record_ticker_heartbeat",
                side_effect=lambda success=False: beats.append(success)):
         t = threading.Thread(target=prov.start, args=(stop,), kwargs={"interval": 0}, daemon=True)
@@ -444,6 +485,7 @@ def test_failing_tick_records_liveness_but_not_success():
     stop = threading.Event()
     prov = InProcessCronScheduler()
     with patch("cron.scheduler.tick", side_effect=RuntimeError("every tick fails")), \
+         patch("cron.scheduler.reconcile_orphaned_runs", return_value=[]), \
          patch("cron.jobs.record_ticker_heartbeat",
                side_effect=lambda success=False: beats.append(success)):
         t = threading.Thread(target=prov.start, args=(stop,), kwargs={"interval": 0}, daemon=True)
