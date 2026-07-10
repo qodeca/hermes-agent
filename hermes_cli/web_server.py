@@ -731,6 +731,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "context": "agent",
     "skills": "agent",
     "cron": "agent",
+    # `alerts.deliver` is the only schema-surfaced operator-alerts field —
+    # fold it into the same "agent" tab as cron rather than spawning a
+    # one-field orphan category.
+    "alerts": "agent",
     "network": "agent",
     "checkpoints": "agent",
     "approvals": "security",

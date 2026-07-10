@@ -2769,6 +2769,19 @@ DEFAULT_CONFIG = {
         "session_output_token_budget": 200000,
     },
 
+    # Operator alerts — a minimal, fire-and-forget notification primitive
+    # (hermes_cli/operator_alerts.py) for surfacing conditions (security
+    # warnings, job failures) that would otherwise sit unnoticed in
+    # errors.log. Thin composition over the existing cron delivery
+    # machinery, not a new platform integration.
+    "alerts": {
+        # Where to deliver alerts, same "platform:chat_id" format cron's
+        # own `deliver` field accepts (e.g. "telegram:8393438634"). Empty
+        # string = disabled (the default) — alerts silently no-op until an
+        # operator opts in.
+        "deliver": "",
+    },
+
     # Kanban multi-agent coordination — controls the dispatcher loop that
     # spawns workers for ready tasks. The dispatcher ticks every N seconds
     # (default 60), reclaims stale claims, promotes dependency-satisfied
@@ -5280,7 +5293,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+    "sessions", "streaming", "updates", "mcp_servers", "alerts",
 }
 
 # Valid fields inside a custom_providers list entry
