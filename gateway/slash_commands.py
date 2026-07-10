@@ -392,6 +392,26 @@ class GatewaySlashCommandsMixin:
             f"Slash commands you can run: {runnable_str}"
         )
 
+    async def _handle_allowlist_command(self, event: MessageEvent) -> str:
+        """Handle /allowlist show — print the effective authorization sources.
+
+        Finding #29: the owner himself was denied after a restart and had no
+        way to answer "why was I denied?" without reading code. Prints the
+        same env allowlists / allow-all flags / pairing grants that
+        ``GatewayAuthorizationMixin._is_user_authorized`` actually consults —
+        see ``gateway.authz_mixin.format_allowlist_report`` for the shared
+        source of truth (kept in one place so this command can't drift from
+        what actually gates access).
+        """
+        from gateway.authz_mixin import format_allowlist_report
+
+        args = event.get_command_args().strip().lower() if event else ""
+        if args != "show":
+            return "Usage: /allowlist show"
+
+        pairing_store = self._pairing_store_for(event.source)
+        return format_allowlist_report(pairing_store)
+
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
         """Handle /kanban — delegate to the shared kanban CLI.
 

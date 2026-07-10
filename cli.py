@@ -8466,6 +8466,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self.show_help()
         elif canonical == "profile":
             self._handle_profile_command()
+        elif canonical == "allowlist":
+            self._handle_allowlist_command(cmd_original)
         elif canonical == "tools":
             self._handle_tools_command(cmd_original)
         elif canonical == "toolsets":

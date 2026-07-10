@@ -515,6 +515,42 @@ class CLICommandsMixin:
         print(f"  Home:    {display}")
         print()
 
+    def _handle_allowlist_command(self, cmd_original: str) -> None:
+        """Handle ``/allowlist show`` — print the effective authorization sources.
+
+        Finding #29: the owner himself was denied after a restart and had no
+        way to answer "why was I denied?" without reading code. Prints the
+        same env allowlists / allow-all flags / pairing grants that
+        ``GatewayAuthorizationMixin._is_user_authorized`` actually consults —
+        see ``format_allowlist_report`` for the shared source of truth.
+        """
+        from gateway.authz_mixin import format_allowlist_report
+        from gateway.pairing import PairingStore
+        from hermes_cli.profiles import get_active_profile_name
+
+        parts = cmd_original.split(maxsplit=1)
+        subcommand = parts[1].strip().lower() if len(parts) > 1 else ""
+        if subcommand != "show":
+            print("  Usage: /allowlist show")
+            return
+
+        # PairingStore(profile=None) resolves the (lazy) default PAIRING_DIR
+        # off the current HERMES_HOME, which already covers both "default"
+        # and "custom" (non-profile custom-root) deployments correctly; only
+        # a genuine named profile needs the explicit profile= kwarg.
+        profile_name = get_active_profile_name()
+        store = (
+            PairingStore(profile=profile_name)
+            if profile_name not in {"default", "custom"}
+            else PairingStore()
+        )
+        report = format_allowlist_report(store)
+
+        print()
+        for line in report.split("\n"):
+            print(f"  {line}" if line else "")
+        print()
+
     def _handle_handoff_command(self, cmd_original: str) -> bool:
         """Handle ``/handoff <platform>`` — transfer this CLI session to a gateway platform.
 

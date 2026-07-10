@@ -18,7 +18,7 @@ import time -> no import cycle. The lazy import preserves the exact logger name
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -26,6 +26,13 @@ from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
 )
+
+if TYPE_CHECKING:
+    # Only for the format_allowlist_report() type hint below — importing at
+    # runtime would be safe too (no cycle: gateway.pairing doesn't import
+    # this module), but TYPE_CHECKING keeps the import list minimal for a
+    # module that's on the hot authorization path.
+    from gateway.pairing import PairingStore
 
 # Per-platform "allow all users" opt-in env vars, keyed by Platform. This is
 # the single source of truth for which env var opens which built-in
@@ -54,6 +61,95 @@ PLATFORM_ALLOW_ALL_ENV: dict[Platform, str] = {
     Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
     Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
 }
+
+# Per-platform "allowed users" env var, keyed by Platform. Single source of
+# truth mirroring ``PLATFORM_ALLOW_ALL_ENV`` above: ``_is_user_authorized``
+# builds its per-call working copy from this mapping (then layers in
+# dynamically registered plugin platforms), and ``/allowlist show``
+# (``format_allowlist_report`` below) reads the same mapping so the command's
+# output can never drift from what actually gates access.
+PLATFORM_ALLOWED_USERS_ENV: dict[Platform, str] = {
+    Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
+    Platform.DISCORD: "DISCORD_ALLOWED_USERS",
+    Platform.WHATSAPP: "WHATSAPP_ALLOWED_USERS",
+    Platform.WHATSAPP_CLOUD: "WHATSAPP_CLOUD_ALLOWED_USERS",
+    Platform.SLACK: "SLACK_ALLOWED_USERS",
+    Platform.SIGNAL: "SIGNAL_ALLOWED_USERS",
+    Platform.EMAIL: "EMAIL_ALLOWED_USERS",
+    Platform.SMS: "SMS_ALLOWED_USERS",
+    Platform.MATTERMOST: "MATTERMOST_ALLOWED_USERS",
+    Platform.MATRIX: "MATRIX_ALLOWED_USERS",
+    Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
+    Platform.FEISHU: "FEISHU_ALLOWED_USERS",
+    Platform.WECOM: "WECOM_ALLOWED_USERS",
+    Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOWED_USERS",
+    Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
+    Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
+    Platform.QQBOT: "QQ_ALLOWED_USERS",
+    Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+}
+
+
+def format_allowlist_report(pairing_store: "Optional[PairingStore]") -> str:
+    """Render the EFFECTIVE authorization sources as compact plain text.
+
+    Backs the ``/allowlist show`` command (finding #29: the owner himself was
+    denied after a restart with no way to answer "why was I denied?" without
+    reading code). Surfaces exactly the sources ``_is_user_authorized``
+    actually consults, in the same order it checks them:
+
+      1. Global allow-all / global env allowlist.
+      2. Per-platform allow-all flags (``PLATFORM_ALLOW_ALL_ENV``).
+      3. Per-platform env allowlists (``PLATFORM_ALLOWED_USERS_ENV``).
+      4. Paired users from the pairing store (a first-class authorization
+         grant — see the pairing-store comment in ``_is_user_authorized``).
+
+    Nothing here is a secret: these are user-ID allowlists and boolean
+    flags, not credentials, so the report prints them in full rather than
+    redacting -- an operator debugging "why was I denied" needs the exact
+    values. ``pairing_store`` may be ``None`` (e.g. a bare CLI invocation
+    before any pairing has ever happened); that section then reads "(none)".
+    """
+    lines: list[str] = ["Allowlist — effective authorization sources", ""]
+
+    lines.append("Global")
+    global_allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip()
+    lines.append(f"  GATEWAY_ALLOW_ALL_USERS: {global_allow_all or '(not set)'}")
+    global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
+    lines.append(f"  GATEWAY_ALLOWED_USERS: {global_allowlist or '(not set)'}")
+    lines.append("")
+
+    lines.append("Per-platform allow-all flags")
+    allow_all_entries = [
+        f"  {env_name}: {value}"
+        for env_name in PLATFORM_ALLOW_ALL_ENV.values()
+        for value in [os.getenv(env_name, "").strip()]
+        if value
+    ]
+    lines.extend(allow_all_entries or ["  (none set)"])
+    lines.append("")
+
+    lines.append("Per-platform env allowlists")
+    allowlist_entries = [
+        f"  {env_name}: {value}"
+        for env_name in PLATFORM_ALLOWED_USERS_ENV.values()
+        for value in [os.getenv(env_name, "").strip()]
+        if value
+    ]
+    lines.extend(allowlist_entries or ["  (none set)"])
+    lines.append("")
+
+    lines.append("Paired users (pairing store)")
+    approved = pairing_store.list_approved() if pairing_store is not None else []
+    if approved:
+        for entry in approved:
+            name = (entry.get("user_name") or "").strip()
+            suffix = f" ({name})" if name else ""
+            lines.append(f"  {entry.get('platform')}: {entry.get('user_id')}{suffix}")
+    else:
+        lines.append("  (none)")
+
+    return "\n".join(lines)
 
 
 class GatewayAuthorizationMixin:
@@ -390,26 +486,10 @@ class GatewayAuthorizationMixin:
         if not user_id:
             return False
 
-        platform_env_map = {
-            Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
-            Platform.DISCORD: "DISCORD_ALLOWED_USERS",
-            Platform.WHATSAPP: "WHATSAPP_ALLOWED_USERS",
-            Platform.WHATSAPP_CLOUD: "WHATSAPP_CLOUD_ALLOWED_USERS",
-            Platform.SLACK: "SLACK_ALLOWED_USERS",
-            Platform.SIGNAL: "SIGNAL_ALLOWED_USERS",
-            Platform.EMAIL: "EMAIL_ALLOWED_USERS",
-            Platform.SMS: "SMS_ALLOWED_USERS",
-            Platform.MATTERMOST: "MATTERMOST_ALLOWED_USERS",
-            Platform.MATRIX: "MATRIX_ALLOWED_USERS",
-            Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
-            Platform.FEISHU: "FEISHU_ALLOWED_USERS",
-            Platform.WECOM: "WECOM_ALLOWED_USERS",
-            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOWED_USERS",
-            Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
-            Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
-            Platform.QQBOT: "QQ_ALLOWED_USERS",
-            Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
-        }
+        # Copy (not alias): the plugin-registry loop right below mutates this
+        # per-call, and the shared module-level PLATFORM_ALLOWED_USERS_ENV
+        # must stay immutable (same pattern as platform_allow_all_map below).
+        platform_env_map = dict(PLATFORM_ALLOWED_USERS_ENV)
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
         }

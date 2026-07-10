@@ -120,6 +120,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("status", "Show session, model, token, and context info", "Session"),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
+    CommandDef("allowlist", "Show effective authorization sources (env allowlists, pairing, allow-all)", "Info",
+               args_hint="[show]", subcommands=("show",)),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",
@@ -1163,7 +1165,13 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - allowlist: `/allowlist show` ops/debugging surface; reached via
+#     /hermes allowlist show on Slack. Added at the registry's 50-command
+#     ceiling (T22) — exempting the new, low-frequency command here (rather
+#     than letting the clamp silently bump an existing native slash, e.g.
+#     /version) is the documented way to add a command once the registry is
+#     already at the cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug", "allowlist"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
