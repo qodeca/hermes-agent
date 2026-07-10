@@ -164,7 +164,7 @@ class InProcessCronScheduler(CronScheduler):
         return "builtin"
 
     def reconcile(self) -> None:
-        """Reconcile orphaned running state left by a hard crash (T3, #2, #22).
+        """Reconcile orphaned running state left by a hard crash.
 
         Overrides the ABC no-op default. Called once by ``start()`` before
         the first tick — see ``cron.scheduler.reconcile_orphaned_runs`` for
@@ -183,11 +183,12 @@ class InProcessCronScheduler(CronScheduler):
         except BaseException as e:
             # Catch BaseException (not just Exception) for the same reason the
             # tick loop below does: a SystemExit from a misbehaving provider
-            # SDK reached via alert delivery (T16's send_operator_alert) must
-            # not prevent the ticker from ever starting (#32612 precedent).
-            # KeyboardInterrupt is intentionally caught here too — shutdown is
-            # driven by stop_event (set by the main thread's signal handler),
-            # not by an exception in this daemon thread.
+            # SDK reached via alert delivery (the optional operator-alerts
+            # hook in cron.scheduler._send_reconcile_alert) must not prevent
+            # the ticker from ever starting (#32612 precedent). KeyboardInterrupt
+            # is intentionally caught here too — shutdown is driven by
+            # stop_event (set by the main thread's signal handler), not by an
+            # exception in this daemon thread.
             logger.error("Startup cron reconciliation failed: %s", e, exc_info=True)
         return None
 
@@ -198,7 +199,7 @@ class InProcessCronScheduler(CronScheduler):
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
-        # T3: reconcile orphaned running state (crash/SIGKILL) before the
+        # Reconcile orphaned running state (crash/SIGKILL) before the
         # first tick, so a restarted scheduler converges durable state
         # before it starts dispatching new runs. mark_running_jobs_interrupted
         # (gateway shutdown) only covers the graceful-drain path; this is the

@@ -1,4 +1,4 @@
-"""Tests for the durable running marker on RECURRING cron jobs (T2, finding 2).
+"""Tests for the durable running marker on RECURRING cron jobs.
 
 Incident: a recurring job fired, ran 2.4h, then died with the gateway — and
 jobs.json still showed ``last_run_at: null``, because run state was persisted
@@ -16,7 +16,7 @@ Covers:
   (c) no-skip regression: a fresh running_marker never causes get_due_jobs()
       to skip the job's next legitimate occurrence (unlike run_claim for
       one-shots);
-  (d) the generalized TTL helper (_run_claim_ttl_seconds) folds in the T4
+  (d) the generalized TTL helper (_run_claim_ttl_seconds) folds in the
       wall-clock runtime cap alongside the inactivity timeout.
 """
 from datetime import timedelta
@@ -157,7 +157,7 @@ class TestRunningMarkerNoSkipRegression:
 
 
 class TestRunClaimTTLWithMaxRuntime:
-    """(d) The generalized TTL helper folds T4's wall-clock runtime cap in
+    """(d) The generalized TTL helper folds the wall-clock runtime cap in
     alongside the inactivity timeout."""
 
     def test_ttl_uses_runtime_axis_when_it_dominates(self, monkeypatch):
@@ -176,7 +176,7 @@ class TestRunClaimTTLWithMaxRuntime:
         assert j._run_claim_ttl_seconds() == float(j.ONESHOT_RUN_CLAIM_TTL_SECONDS)
 
     def test_ttl_default_respects_default_wall_clock_cap(self, monkeypatch):
-        """With nothing configured, the default max-runtime cap (3600s, T4)
+        """With nothing configured, the default max-runtime cap (3600s)
         pulls the TTL above the historical 1800s inactivity-only default —
         the recovery window must not be shorter than a legitimately full-
         length run under the wall-clock cap."""

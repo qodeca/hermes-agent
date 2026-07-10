@@ -17,8 +17,8 @@ is set. We patch `cron.scheduler.tick` (both tickers import it locally as
 drives it and stops promptly.
 
 Every test that drives ``start()`` (directly or via the two ticker entry
-points above) also patches ``cron.scheduler.reconcile_orphaned_runs`` — T3
-wired ``start()`` to call it once before the loop, and without a stub it
+points above) also patches ``cron.scheduler.reconcile_orphaned_runs`` —
+``start()`` calls it once before the loop, and without a stub it
 would hit the real (frozen-at-import) cron storage path via
 ``InProcessCronScheduler.reconcile()``, which is exactly what these tests
 must never do. Dedicated reconciliation behavior is covered by
@@ -341,7 +341,7 @@ def test_builtin_inherits_on_jobs_changed_default():
 
 
 def test_builtin_reconcile_runs_orphan_reconciliation(tmp_path, monkeypatch):
-    """T3: unlike on_jobs_changed, the built-in DOES override reconcile() — it
+    """Unlike on_jobs_changed, the built-in DOES override reconcile() — it
     calls cron.scheduler.reconcile_orphaned_runs() and swallows any error so a
     reconciliation bug can never block the ticker from starting. Hermetic:
     points cron storage at a temp dir with no jobs, so this never touches the

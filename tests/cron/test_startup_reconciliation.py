@@ -1,4 +1,4 @@
-"""Tests for T3: startup reconciliation of orphaned cron runs (findings 2, 22).
+"""Tests for startup reconciliation of orphaned cron runs.
 
 Incident: the gateway died mid-run (SIGKILL/OOM/crash). ``mark_job_run`` never
 executed, so the run vanished — no error recorded, no operator alert.
@@ -11,7 +11,7 @@ nothing reconciled at startup, until now.
 complement, called once by ``InProcessCronScheduler.start()`` before the
 first tick. It considers two independent kinds of orphan:
 
-  - recurring jobs' ``running_marker`` (T2) — always reconciled once reapable;
+  - recurring jobs' ``running_marker`` — always reconciled once reapable;
   - one-shot jobs' ``run_claim`` — reconciled ONLY when the one-shot's retry
     budget is exhausted (``repeat.completed >= repeat.times``); a claim with
     retry budget remaining is left for ``_get_due_jobs_locked``'s own
@@ -39,16 +39,17 @@ Covers:
       untouched; distinct pinned HERMES_MACHINE_ID values on one host ->
       treated as foreign;
   (d) a stale one-shot run_claim whose retry budget is exhausted -> reconciled
-      to error (the T2-reviewer boundary: the due-scan would otherwise
-      silently pop this job with no recorded error);
+      to error (otherwise the due-scan would silently pop this job with no
+      recorded error);
   (e) a stale one-shot run_claim with retry budget remaining -> left alone for
       the due-scan's own stale-claim recovery;
   (f) InProcessCronScheduler.start() calls reconcile() exactly once, before
       the first tick;
   (g) the guarded-import operator alert: degrades to logger.warning while
-      hermes_cli.operator_alerts.send_operator_alert does not exist (current
-      state — T16 ships it in a later slice), and routes through it once it
-      does, with no code change required here.
+      hermes_cli.operator_alerts.send_operator_alert does not exist (an
+      optional, not-yet-implemented alert-routing extension point), and
+      routes through it once such a module is added, with no code change
+      required here.
 """
 import logging
 import os
@@ -259,7 +260,7 @@ class TestOneShotRunClaimReconciliation:
         # completed >= times: no retry budget left. Without reconciliation,
         # _get_due_jobs_locked's "dispatch limit reached" branch would
         # silently pop this from jobs.json on the next tick with no recorded
-        # error and no alert — exactly the T2-reviewer gap this closes.
+        # error and no alert — exactly the gap this reconciliation closes.
         j.save_jobs([_oneshot_job(times=1, completed=1, run_claim=stale_claim)])
 
         reconciled = s.reconcile_orphaned_runs()
@@ -371,13 +372,13 @@ class TestReconcileCalledOnceBeforeFirstTick:
 
     @pytest.mark.parametrize("exc", [SystemExit(1), KeyboardInterrupt()])
     def test_inprocess_reconcile_swallows_baseexception(self, exc):
-        """BaseException too, mirroring the tick loop's guard (#32612): once
-        T16's alert delivery lands, a SystemExit from a misbehaving provider
-        SDK reached via _send_reconcile_alert must not escape reconcile() and
-        prevent the ticker from ever starting. KeyboardInterrupt is swallowed
-        for the same reason as in the tick loop — shutdown is driven by
-        stop_event (set by the main thread's signal handler), not by
-        exceptions in this daemon thread."""
+        """BaseException too, mirroring the tick loop's guard (#32612): a
+        SystemExit from a misbehaving provider SDK reached via
+        _send_reconcile_alert's optional alert delivery must not escape
+        reconcile() and prevent the ticker from ever starting.
+        KeyboardInterrupt is swallowed for the same reason as in the tick
+        loop — shutdown is driven by stop_event (set by the main thread's
+        signal handler), not by exceptions in this daemon thread."""
         from cron.scheduler_provider import InProcessCronScheduler
 
         with patch("cron.scheduler.reconcile_orphaned_runs", side_effect=exc):
@@ -385,17 +386,23 @@ class TestReconcileCalledOnceBeforeFirstTick:
 
 
 class TestGuardedOperatorAlert:
-    """(g): the T16 guarded-import alert pattern."""
+    """(g): the guarded-import alert pattern — hermes_cli.operator_alerts is
+    an optional, not-yet-implemented alert-routing extension point."""
 
     def test_degrades_to_logger_warning_when_operator_alerts_module_missing(
-        self, tmp_cron_dir, caplog,
+        self, tmp_cron_dir, caplog, monkeypatch,
     ):
-        """Current state: hermes_cli.operator_alerts does not exist yet (T16
-        ships it later). reconcile_orphaned_runs() must still reconcile the
-        job and must not raise — it degrades to logger.warning."""
-        assert "hermes_cli.operator_alerts" not in sys.modules
-        with pytest.raises(ImportError):
-            import hermes_cli.operator_alerts  # noqa: F401
+        """Simulate the module's absence regardless of whether it actually
+        exists on disk — asserting ``pytest.raises(ImportError)`` on a real
+        import would turn this into a change-detector that breaks the day
+        hermes_cli.operator_alerts ships. Setting sys.modules[name] = None
+        forces Python's import machinery to raise ImportError for that name
+        even if a real module is importable, which is exactly the "module
+        unavailable" condition _send_reconcile_alert's guarded import is
+        built to degrade gracefully from — reconcile_orphaned_runs() must
+        still reconcile the job and must not raise; it degrades to
+        logger.warning."""
+        monkeypatch.setitem(sys.modules, "hermes_cli.operator_alerts", None)
 
         now = j._hermes_now()
         stale_marker = {"at": (now - timedelta(hours=3)).isoformat(), "by": "otherhost:999"}
@@ -410,7 +417,7 @@ class TestGuardedOperatorAlert:
         ), "expected a logger.warning fallback when operator_alerts is unavailable"
 
     def test_routes_through_send_operator_alert_once_available(self, tmp_cron_dir, monkeypatch):
-        """Once hermes_cli.operator_alerts.send_operator_alert exists (T16),
+        """Once hermes_cli.operator_alerts.send_operator_alert exists,
         the guarded import picks it up with no code change here."""
         import types
 

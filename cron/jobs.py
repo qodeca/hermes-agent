@@ -113,8 +113,8 @@ ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
 # a claim/marker as stale.
 _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 
-# The wall-clock-derived term is the cron max-runtime cap (T4,
-# _resolve_cron_max_runtime) times this headroom multiplier. Unlike the
+# The wall-clock-derived term is the cron max-runtime cap
+# (_resolve_cron_max_runtime, below) times this headroom multiplier. Unlike the
 # inactivity timeout, the runtime cap already bounds a run's TOTAL wall-clock
 # time, so a smaller multiplier than the inactivity headroom is enough
 # comfortable margin over a run that legitimately used its full budget.
@@ -122,9 +122,9 @@ _RUN_CLAIM_TTL_RUNTIME_HEADROOM = 1.5
 
 _DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
 
-# Default wall-clock runtime cap (seconds) — mirrors cron/scheduler.py's
-# _resolve_cron_max_runtime default. Kept in sync manually; both live under
-# cron/ and change together.
+# Default wall-clock runtime cap (seconds) for a single cron job run, used by
+# _resolve_cron_max_runtime below when neither HERMES_CRON_MAX_RUNTIME nor
+# cron.max_runtime_seconds is configured.
 _DEFAULT_CRON_MAX_RUNTIME = 3600.0
 
 
@@ -184,7 +184,7 @@ def _run_claim_ttl_seconds() -> float:
     """Resolve the run-claim / running-marker stale-recovery TTL.
 
     Shared by the one-shot ``run_claim`` due-skip guard (#59229) and the
-    recurring ``running_marker`` visibility marker (T2): both need a
+    recurring ``running_marker`` visibility marker: both need a
     "how long before we treat this claim as abandoned by a dead tick"
     bound, derived from how long a run is actually allowed to take instead
     of a magic constant.
@@ -195,7 +195,7 @@ def _run_claim_ttl_seconds() -> float:
 
     - inactivity axis: ``HERMES_CRON_TIMEOUT * 3`` (unset/invalid → default
       600s inactivity limit → 1800s; ``0`` unlimited → axis excluded)
-    - wall-clock axis: cron's max-runtime cap (T4, ``_resolve_cron_max_runtime``)
+    - wall-clock axis: cron's max-runtime cap (``_resolve_cron_max_runtime``)
       ``* 1.5`` (unlimited → axis excluded)
 
     The TTL is the max of whichever axes are finite, floored at
@@ -1482,7 +1482,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # is claimable again. No-op if the job never carried a claim.
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
-                # Clear the recurring running-marker (T2): the run is over —
+                # Clear the recurring running-marker: the run is over —
                 # last_status above already reflects the outcome ("ok"/"error"),
                 # so there is nothing else to reconcile. No-op if the job never
                 # carried a marker (one-shots never do).
@@ -1944,13 +1944,13 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         needs_save = True
                         break
 
-            # Durable running marker for RECURRING jobs (T2, finding 2): a
-            # cron/interval job that fires and then dies mid-run (gateway
-            # killed, OOM, crash) previously left no trace in jobs.json until
-            # mark_job_run() ran — last_run_at stayed null and the run was
-            # invisible even though it may have run for hours. Stamp a
-            # SEPARATE running_marker (NOT run_claim) at fire time, plus
-            # last_status="running", so the in-flight run is durably visible.
+            # Durable running marker for RECURRING jobs: a cron/interval job
+            # that fires and then dies mid-run (gateway killed, OOM, crash)
+            # previously left no trace in jobs.json until mark_job_run() ran
+            # — last_run_at stayed null and the run was invisible even though
+            # it may have run for hours. Stamp a SEPARATE running_marker (NOT
+            # run_claim) at fire time, plus last_status="running", so the
+            # in-flight run is durably visible.
             #
             # Deliberately NOT reusing run_claim: run_claim's due-skip
             # semantics above (kind == "once" branch, top of this loop) exist
@@ -1959,8 +1959,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # visible — so running_marker carries no such skip guard anywhere.
             # mark_job_run() clears the marker (and overwrites last_status)
             # on completion; a marker left behind by a dead tick is stale
-            # visibility only, recovered by T3's startup reconciliation
-            # rather than any due-skip logic here.
+            # visibility only, recovered by cron/scheduler.py's startup
+            # reconciliation (reconcile_orphaned_runs) rather than any
+            # due-skip logic here.
             if kind in {"cron", "interval"}:
                 marker = {"at": now.isoformat(), "by": _machine_id()}
                 job["running_marker"] = marker

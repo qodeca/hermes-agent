@@ -2694,11 +2694,11 @@ DEFAULT_CONFIG = {
         # inactivity timeout (HERMES_CRON_TIMEOUT, default 600s) — which
         # resets on every API/tool/stream event and so does not bound a
         # job that stays *active* against a failing backend (e.g. retrying
-        # a slow/hanging call in a loop; finding 3 — an overnight job ran
-        # 2.4+ hours this way). Overridable via HERMES_CRON_MAX_RUNTIME env
-        # var, which takes precedence over this config value. 0 or negative
-        # disables the cap (unlimited — the inactivity timeout is then the
-        # only bound). Default 3600 (1 hour).
+        # a slow/hanging call in a loop — an incident saw an overnight job
+        # run 2.4+ hours this way). Overridable via HERMES_CRON_MAX_RUNTIME
+        # env var, which takes precedence over this config value. 0 or
+        # negative disables the cap (unlimited — the inactivity timeout is
+        # then the only bound). Default 3600 (1 hour).
         "max_runtime_seconds": 3600,
     },
 

@@ -408,16 +408,16 @@ def _consume_interrupted_flag(job_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# T3: startup reconciliation of orphaned runs (findings 2, 22).
+# Startup reconciliation of orphaned runs.
 #
 # mark_running_jobs_interrupted above handles the GRACEFUL shutdown path —
 # in-memory job ids, force-killed tool subprocesses, still able to run
 # mark_job_run before the process exits. A SIGKILL/OOM/hard crash bypasses
 # that path entirely: the process never gets to run its shutdown hook, so a
-# recurring job's durable running_marker (T2) or a one-shot's run_claim
-# (#59229) can be left stamped in jobs.json with no process left alive to
-# clear it — the run vanishes (last_run_at stays null, or the job is later
-# silently removed with no recorded error). reconcile_orphaned_runs() is the
+# recurring job's durable running_marker or a one-shot's run_claim (#59229)
+# can be left stamped in jobs.json with no process left alive to clear it —
+# the run vanishes (last_run_at stays null, or the job is later silently
+# removed with no recorded error). reconcile_orphaned_runs() is the
 # durable-state complement, run ONCE at scheduler startup before the first
 # tick (InProcessCronScheduler.start()).
 # ---------------------------------------------------------------------------
@@ -483,40 +483,49 @@ def _stamp_is_reapable(
 def _send_reconcile_alert(job_id: str, job_name: str, reason: str) -> None:
     """Emit one operator alert per job reconciled at startup.
 
-    Guarded import: ``hermes_cli.operator_alerts.send_operator_alert`` does
-    not exist yet — it ships in a later slice of this workstream (T16). Until
-    then this degrades to a plain ``logger.warning`` so the reconciliation is
-    still visible in ``errors.log`` / ``hermes logs``. Once T16 lands, this
-    starts routing through the real operator-alert channel with NO code
-    change here — only the import stops raising ``ImportError``.
+    Guarded import: ``hermes_cli.operator_alerts.send_operator_alert`` is an
+    optional, not-yet-implemented alert-routing extension point — this
+    module does not depend on any concrete delivery channel (email, Slack,
+    PagerDuty, etc.) existing. Until such a module is added, this degrades to
+    a plain ``logger.warning`` so the reconciliation is still visible in
+    ``errors.log`` / ``hermes logs``. Once a real ``hermes_cli.operator_alerts``
+    module ships, this starts routing through it with NO code change here —
+    only the import stops raising ``ImportError``.
     """
     message = (
         f"Cron job '{job_name}' ({job_id}) was interrupted mid-run and "
         f"reconciled at scheduler startup: {reason}"
     )
     try:
-        # T16 has not shipped yet — this module does not exist in the
-        # current tree. ty (correctly) flags the reference; suppressed
-        # deliberately so the guarded import can land ahead of T16.
+        # hermes_cli.operator_alerts does not exist in the current tree —
+        # this is a forward-compatible guarded import for a module that may
+        # be added later. ty (correctly) flags the reference; suppressed
+        # deliberately so the guarded import can land ahead of that module.
         from hermes_cli.operator_alerts import send_operator_alert  # type: ignore[unresolved-import]
     except ImportError:
         logger.warning(message)
         return
     try:
         send_operator_alert(message)
-    except Exception as e:
+    except BaseException as e:
+        # BaseException, not just Exception: a delivery SDK reached through
+        # this optional alert channel could raise SystemExit (e.g. a
+        # misbehaving provider client) — that must not escape the per-job
+        # guard in reconcile_orphaned_runs() below and abort reconciliation
+        # of the remaining jobs, consistent with the BaseException handling
+        # already used at the provider/tick level for the same reason.
         logger.warning("%s (alert delivery failed: %s)", message, e)
 
 
 def reconcile_orphaned_runs() -> list:
-    """Reconcile cron runs orphaned by a hard process death (T3, findings 2, 22).
+    """Reconcile cron runs orphaned by a hard process death.
 
     Called once by ``InProcessCronScheduler.start()`` before the first tick.
     Scans every stored job (including disabled ones — a job paused mid-run
     still deserves its orphaned state cleared) for two independent kinds of
     stale in-flight marker:
 
-    1. Recurring jobs (``running_marker``, T2): always reconciled once
+    1. Recurring jobs (``running_marker``): always reconciled once
        reapable (see ``_stamp_is_reapable``). The marker carries no due-skip
        semantics, so clearing it via ``mark_job_run`` and recording
        ``last_status="error"`` cannot interfere with the job's next
@@ -536,7 +545,7 @@ def reconcile_orphaned_runs() -> list:
        already exhausted (``repeat.completed >= repeat.times``) — exactly the
        case where ``_get_due_jobs_locked``'s "dispatch limit reached" branch
        would otherwise silently pop the job from jobs.json with no recorded
-       error and no operator alert (the T2-reviewer finding this closes).
+       error and no operator alert — the gap this reconciliation closes.
        One-shots that still have retry budget left are deliberately skipped
        here; the due-scan's existing recovery is the correct and sufficient
        path for those, and reconciling them early would prematurely
@@ -3870,6 +3879,17 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             # after interpreter shutdown" and crashes the tick. Skip cleanly —
             # the job stays due and will fire on the next healthy tick
             # (#58720, #55924).
+            #
+            # Known narrow window: for a recurring job, get_due_jobs() already
+            # stamped running_marker + last_status="running" and persisted it
+            # BEFORE this function was ever called (see
+            # cron/jobs.py:_get_due_jobs_locked) — returning None here skips
+            # the dispatch without clearing that marker. Startup reconciliation
+            # (reconcile_orphaned_runs) will later treat that stale marker as
+            # an "interrupted mid-run" job even though the run never actually
+            # began. Harmless in practice (the job still fires on its next
+            # tick and interpreter shutdown is rare/brief), just not a
+            # perfectly accurate error record.
             if _interpreter_shutting_down():
                 logger.warning(
                     "Job '%s' not dispatched — interpreter is shutting down",
@@ -3895,6 +3915,8 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             except RuntimeError as submit_err:
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
+                # Same narrow "marker stamped but never dispatched" window
+                # noted above applies here too.
                 if _interpreter_shutting_down(submit_err):
                     with _running_lock:
                         _running_job_ids.discard(job_id)

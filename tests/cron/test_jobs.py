@@ -1026,8 +1026,8 @@ class TestGetDueJobs:
         """The stale-recovery TTL tracks HERMES_CRON_TIMEOUT (3x headroom), with
         the fixed constant as a floor, and falls back to the constant when runs
         are unbounded (timeout=0). Pins HERMES_CRON_MAX_RUNTIME=0 (unlimited) so
-        only the inactivity axis is exercised here — the wall-clock axis added
-        in T2 has its own dedicated coverage in test_run_claim_recurring.py."""
+        only the inactivity axis is exercised here — the wall-clock axis has
+        its own dedicated coverage in test_run_claim_recurring.py."""
         from cron.jobs import (
             _run_claim_ttl_seconds as ttl,
             ONESHOT_RUN_CLAIM_TTL_SECONDS as FLOOR,
