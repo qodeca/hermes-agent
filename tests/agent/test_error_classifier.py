@@ -65,6 +65,7 @@ class TestFailoverReason:
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
+            "backend_capacity",
             "unknown",
         }
         actual = {r.value for r in FailoverReason}
@@ -2047,3 +2048,111 @@ class Test408RequestTimeout:
         assert result.retryable is True
         assert result.should_compress is False
 
+
+
+# ── Test: backend capacity (deterministic memory-guard 400s) ────────────
+
+class TestBackendCapacity:
+    """Local inference backends (oMLX, MLX-based servers) reject a request
+    whose prefill would exceed the runner's memory budget with a
+    deterministic HTTP 400 (e.g. ``prefill_memory_exceeded``). The message
+    is short, so the generic-400 heuristic (``len < 30`` + large session)
+    used to misroute it to context_overflow → an endless compress-and-
+    resubmit loop. These must classify as ``backend_capacity``:
+    non-retryable, never compressed, fallback-eligible."""
+
+    def test_400_prefill_memory_exceeded_code_large_session(self):
+        """The incident shape: body.error.code carries the oMLX code and the
+        session is large — must NOT hit the generic-400 context_overflow
+        heuristic even though the message is under 30 chars."""
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={"error": {"code": "prefill_memory_exceeded",
+                            "message": "prefill_memory_exceeded"}},
+        )
+        result = classify_api_error(e, approx_tokens=150000, context_length=200000)
+        assert result.reason == FailoverReason.backend_capacity
+        assert result.retryable is False
+        assert result.should_compress is False
+        assert result.should_fallback is True
+
+    def test_400_prefill_memory_exceeded_small_session(self):
+        """Deterministic backend rejection is size-independent."""
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={"error": {"code": "prefill_memory_exceeded",
+                            "message": "prefill_memory_exceeded"}},
+        )
+        result = classify_api_error(e, approx_tokens=1000, context_length=200000)
+        assert result.reason == FailoverReason.backend_capacity
+        assert result.retryable is False
+
+    def test_400_omlx_code_field_variant(self):
+        """Some oMLX builds put the code in ``error.omlx_code`` with a
+        generic human message — still backend_capacity."""
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={"error": {"omlx_code": "prefill_memory_exceeded",
+                            "message": "model runner rejected the request"}},
+        )
+        result = classify_api_error(e, approx_tokens=150000, context_length=200000)
+        assert result.reason == FailoverReason.backend_capacity
+        assert result.retryable is False
+        assert result.should_compress is False
+
+    def test_400_memory_guard_message(self):
+        e = MockAPIError(
+            "request rejected by memory guard",
+            status_code=400,
+            body={"error": {"message": "request rejected by memory guard"}},
+        )
+        result = classify_api_error(e, approx_tokens=150000, context_length=200000)
+        assert result.reason == FailoverReason.backend_capacity
+        assert result.retryable is False
+        assert result.should_compress is False
+
+    def test_400_kv_cache_exceeded_variants(self):
+        for msg in (
+            "kv cache exceeded for this request",
+            "kv-cache exceeded: prompt does not fit",
+            "kv_cache_exceeded",
+        ):
+            e = MockAPIError(
+                msg,
+                status_code=400,
+                body={"error": {"message": msg}},
+            )
+            result = classify_api_error(e, approx_tokens=150000, context_length=200000)
+            assert result.reason == FailoverReason.backend_capacity, msg
+            assert result.retryable is False, msg
+            assert result.should_compress is False, msg
+
+    def test_503_at_capacity_still_overloaded(self):
+        """No cross-contamination: 503 'at capacity' is a transient provider
+        overload (backoff + retry), NOT the deterministic backend_capacity."""
+        e = MockAPIError("The server is at capacity right now", status_code=503)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+
+    def test_message_only_overloaded_still_overloaded(self):
+        """No cross-contamination: message-only overload wording (no status)
+        keeps its transient overloaded classification."""
+        e = MockAPIError("service is temporarily overloaded")
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+
+    def test_400_generic_large_session_still_context_overflow(self):
+        """Guard: the generic-400 + large-session heuristic keeps routing
+        genuinely-unlabeled 400s to context_overflow."""
+        e = MockAPIError(
+            "Error",
+            status_code=400,
+            body={"error": {"message": "Error"}},
+        )
+        result = classify_api_error(e, approx_tokens=150000, context_length=200000)
+        assert result.reason == FailoverReason.context_overflow

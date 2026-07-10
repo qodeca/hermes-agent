@@ -51,6 +51,13 @@ class FailoverReason(enum.Enum):
     context_overflow = "context_overflow"  # Context too large — compress, not failover
     payload_too_large = "payload_too_large"  # 413 — compress payload
     image_too_large = "image_too_large"   # Native image part exceeds provider's per-image limit — shrink and retry
+    # Deterministic backend memory/capacity rejection (HTTP 400 from local
+    # inference runners, e.g. oMLX ``prefill_memory_exceeded``).  Distinct
+    # from ``overloaded`` (transient 503 "at capacity" — backoff + retry)
+    # and from ``context_overflow`` (compression helps): the backend's
+    # memory guard rejects this request identically on every attempt, and
+    # compressing just resubmits into the same wall.  Abort, allow fallback.
+    backend_capacity = "backend_capacity"
 
     # Model / provider policy
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
@@ -236,6 +243,26 @@ _MULTIMODAL_TOOL_CONTENT_PATTERNS = [
     "expected string, got array",
     # Alibaba/DashScope variant
     "tool_call.content must be string",
+]
+
+# Backend memory/capacity rejection patterns — deterministic 400s from
+# local inference runners whose memory guard refuses the request outright.
+# The canonical case is oMLX's ``prefill_memory_exceeded`` (returned 1,800+
+# times in one observed session): the bare code is only 23 characters, so
+# without an explicit pattern it satisfies the generic-400 heuristic
+# (``len < 30`` + large session) below and gets misrouted to
+# ``context_overflow`` with ``should_compress=True`` — an endless
+# compress-and-resubmit loop, because compression never shrinks the prompt
+# below the runner's memory budget.  Kept deliberately separate from
+# ``_OVERLOADED_PATTERNS`` ("at capacity" etc.): those are transient
+# 503-style server-busy signals where backoff + retry is correct; these are
+# deterministic per-request rejections where it is not.
+_BACKEND_CAPACITY_PATTERNS = [
+    "prefill_memory_exceeded",   # oMLX memory-guard code (body code or message)
+    "memory guard",              # generic memory-guard wording
+    "kv cache exceeded",         # kv-cache budget variants
+    "kv-cache exceeded",
+    "kv_cache_exceeded",
 ]
 
 # Context overflow patterns
@@ -1112,6 +1139,36 @@ def _classify_400(
 ) -> ClassifiedError:
     """Classify 400 Bad Request — context overflow, format error, or generic."""
 
+    # Backend memory/capacity rejection.  Must be checked BEFORE both the
+    # explicit context-overflow patterns and the generic-400 + large-session
+    # heuristic at the bottom of this function: the canonical
+    # ``prefill_memory_exceeded`` message is under 30 characters, so on a
+    # large session the generic heuristic would classify it as
+    # ``context_overflow`` with ``should_compress=True`` and the loop would
+    # compress-and-resubmit into the same deterministic rejection forever.
+    # The code may arrive in ``error.code`` (already surfaced via
+    # ``error_code``), in an ``error.omlx_code`` side-channel, or only in
+    # the message text.
+    _omlx_code = ""
+    if isinstance(body, dict):
+        _err_obj = body.get("error", {})
+        if isinstance(_err_obj, dict):
+            _omlx_code = str(_err_obj.get("omlx_code") or "").strip().lower()
+        if not _omlx_code:
+            _omlx_code = str(body.get("omlx_code") or "").strip().lower()
+    error_code_lower = (error_code or "").lower()
+    if (
+        error_code_lower in _BACKEND_CAPACITY_PATTERNS
+        or _omlx_code in _BACKEND_CAPACITY_PATTERNS
+        or any(p in error_msg for p in _BACKEND_CAPACITY_PATTERNS)
+    ):
+        return result_fn(
+            FailoverReason.backend_capacity,
+            retryable=False,
+            should_compress=False,
+            should_fallback=True,
+        )
+
     # Multimodal tool content rejected from 400.  Must be checked BEFORE
     # image_too_large because the recovery is different (strip image parts
     # from tool messages, mark the model as no-list-tool-content for the
@@ -1139,7 +1196,6 @@ def _classify_400(
     # contain context-like phrasing ("encrypted content … could not be
     # verified") which could otherwise trip the context_overflow heuristics.
     # ``error_msg`` is lowercased upstream — match accordingly.
-    error_code_lower = (error_code or "").lower()
     if (
         error_code_lower == "invalid_encrypted_content"
         or "invalid_encrypted_content" in error_msg
