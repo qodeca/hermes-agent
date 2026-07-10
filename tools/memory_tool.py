@@ -73,6 +73,7 @@ ENTRY_DELIMITER = "\n§\n"
 # ---------------------------------------------------------------------------
 
 from tools.threat_patterns import first_threat_message as _first_threat_message
+from tools.curator_write_guard import scan_curator_write as _scan_curator_write
 
 
 def _scan_memory_content(content: str) -> Optional[str]:
@@ -339,6 +340,14 @@ class MemoryStore:
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
 
+        # Curator (background-review) writes get an additional gate ahead of
+        # the general scan below: on a hit it logs a WARNING naming the
+        # matched pattern and counts toward T17's denial breaker. No-op for
+        # interactive writes -- see tools/curator_write_guard.py.
+        curator_block = _scan_curator_write(content, "memory:add")
+        if curator_block:
+            return curator_block
+
         # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
         if scan_error:
@@ -393,6 +402,12 @@ class MemoryStore:
             return {"success": False, "error": "old_text cannot be empty."}
         if not new_content:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
+
+        # Curator (background-review) writes get an additional gate ahead of
+        # the general scan below -- see tools/curator_write_guard.py.
+        curator_block = _scan_curator_write(new_content, "memory:replace")
+        if curator_block:
+            return curator_block
 
         # Scan replacement content for injection/exfiltration
         scan_error = _scan_memory_content(new_content)

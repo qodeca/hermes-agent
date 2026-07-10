@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_constants import get_hermes_home, display_hermes_home
 from utils import atomic_replace, is_truthy_value
 from hermes_cli.config import cfg_get
+from tools.curator_write_guard import scan_curator_write as _scan_curator_write
 
 logger = logging.getLogger(__name__)
 
@@ -1023,6 +1024,14 @@ def _patch_skill(
                 "error": f"Patch would break SKILL.md structure: {err}",
             }
 
+    # Curator (background-review) writes get an injection-scan gate on the
+    # text actually being introduced (new_string, not the whole file, so
+    # pre-existing unrelated content in the target never trips this) -- see
+    # tools/curator_write_guard.py. No-op for foreground/user-directed patches.
+    curator_block = _scan_curator_write(new_string, "skill_manage:patch")
+    if curator_block:
+        return curator_block
+
     original_content = content  # for rollback
     _atomic_write_text(target, new_content)
 
@@ -1190,6 +1199,14 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         )
         if read_guard:
             return read_guard
+
+    # Curator (background-review) writes get an injection-scan gate on the
+    # full file content being written -- see tools/curator_write_guard.py.
+    # No-op for foreground/user-directed writes.
+    curator_block = _scan_curator_write(file_content, "skill_manage:write_file")
+    if curator_block:
+        return curator_block
+
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
