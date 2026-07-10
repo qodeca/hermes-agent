@@ -1324,6 +1324,40 @@ class TestBackendFaultTriggerReason:
         assert result is not None
         assert "summary via aux model" in result
 
+    def test_backend_fault_trigger_wins_over_active_generic_cooldown(self):
+        """(e) Ordering regression: an active cooldown left over from a
+        PRIOR, unrelated generic summary failure must not swallow an
+        explicit backend-fault trigger_reason. The trigger_reason guard
+        must be evaluated before the cooldown check so
+        ``_last_summary_backend_fault`` still gets set and ``compress()``
+        aborts (preserving messages) instead of falling through to the
+        lossy static-drop path."""
+        c = self._compressor()
+        msgs = self._msgs(12)
+
+        # Simulate an active cooldown from an earlier, generic (non-backend
+        # -fault) summary failure. force=False (the auto-compress default)
+        # so compress() does NOT clear the cooldown before calling
+        # _generate_summary() — that clearing only happens when force=True,
+        # which would mask the ordering bug this test targets.
+        c._record_compression_failure_cooldown(999.0, "prior generic failure")
+        assert c._summary_failure_cooldown_until > 0
+
+        with patch("agent.context_compressor.call_llm") as mock_call:
+            result = c.compress(
+                msgs, current_tokens=999999,
+                trigger_reason="backend_capacity",
+            )
+
+        mock_call.assert_not_called()
+        # Abort-preserve, not the lossy static drop: messages unchanged.
+        assert result == msgs
+        assert len(result) == len(msgs)
+        assert c._last_compress_aborted is True
+        assert c._last_summary_backend_fault is True
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+
 
 class TestSummaryFailureBackendFaultClassification:
     """T10 (the REAL residual path): threshold-triggered compression runs

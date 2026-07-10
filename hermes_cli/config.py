@@ -1610,15 +1610,19 @@ DEFAULT_CONFIG = {
         # summaries working when the main model's summary calls fail with
         # rate-limit/timeout-class errors — the summary goes to a healthy
         # endpoint instead of the one that's already struggling. Scope note:
-        # capacity/overload-class backend faults do NOT route through this
-        # setting — the compressor classifies the summary call's own failure
-        # and aborts compression outright (messages preserved unchanged)
-        # rather than attempting any endpoint; see
-        # ContextCompressor._generate_summary's backend-fault handling. When
-        # left at the "auto"/"" defaults, compression summarises using the
-        # main model/endpoint, so a sustained main-model fault also blocks
-        # compression until it recovers (by design — an abort beats a lossy
-        # context drop).
+        # capacity/overload-class backend faults DO route through this
+        # setting — with a distinct healthy aux configured, a main-backend
+        # capacity outage still gets summarised via the aux and compression
+        # succeeds normally. Compression only aborts (messages preserved
+        # unchanged, no further endpoint attempted) once the summary call
+        # itself — after any aux-to-main fallback has already run — fails
+        # with a capacity/overload-class error, or when the caller passes an
+        # explicit backend-fault trigger_reason that skips the call outright;
+        # see ContextCompressor._generate_summary's backend-fault handling.
+        # When left at the "auto"/"" defaults, compression summarises using
+        # the main model/endpoint, so a sustained main-model fault also
+        # blocks compression until it recovers (by design — an abort beats a
+        # lossy context drop).
         "compression": {
             "provider": "auto",
             "model": "",

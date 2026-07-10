@@ -1801,12 +1801,6 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         placeholder.
         """
         now = time.monotonic()
-        if now < self._summary_failure_cooldown_until:
-            logger.debug(
-                "Skipping context summary during cooldown (%.0fs remaining)",
-                self._summary_failure_cooldown_until - now,
-            )
-            return None
 
         if trigger_reason in _BACKEND_FAULT_TRIGGER_REASONS:
             # The error that triggered THIS compression attempt was the
@@ -1818,6 +1812,14 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # cooldown so subsequent auto-compress attempts back off too,
             # and flag it so ``compress()`` aborts instead of falling back to
             # the lossy static-drop path.
+            #
+            # This must run BEFORE the generic cooldown check below: an
+            # active cooldown left over from a prior, unrelated summary
+            # failure must not swallow an explicit backend-fault trigger
+            # without setting ``_last_summary_backend_fault`` — otherwise
+            # ``compress()`` would fall through to the lossy static drop
+            # even though the caller told us this trigger was a backend
+            # fault.
             _msg = (
                 f"compression trigger was a backend fault ({trigger_reason}) — "
                 "skipping the summary call against the same endpoint"
@@ -1831,6 +1833,13 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 "Skipping context summary: %s. Further summary attempts "
                 "paused for %d seconds.",
                 _msg, _BACKEND_FAULT_COOLDOWN_SECONDS,
+            )
+            return None
+
+        if now < self._summary_failure_cooldown_until:
+            logger.debug(
+                "Skipping context summary during cooldown (%.0fs remaining)",
+                self._summary_failure_cooldown_until - now,
             )
             return None
 
