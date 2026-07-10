@@ -464,6 +464,135 @@ def _get_child_timeout() -> Optional[float]:
     return DEFAULT_CHILD_TIMEOUT
 
 
+_DEFAULT_SYNC_FALLBACK_TIMEOUT = 600.0
+
+
+def _get_sync_fallback_timeout() -> Optional[float]:
+    """Read delegation.sync_fallback_timeout_seconds from config.
+
+    Wall-clock bound on the pool-at-capacity inline fallback (see the
+    ``dispatch.get("status") != "dispatched"`` branch of ``delegate_task``):
+    when ``background=true`` but the async delegation pool is already
+    saturated, the batch runs synchronously on the tool-executor thread
+    instead of dispatching a background handle. Before this cap existed
+    that inline run had no bound at all — a hung child blocked the parent
+    turn indefinitely (58 minutes in the incident that motivated this
+    knob). This does NOT apply to the separate stateless-session inline
+    fallback (issue #10760): that path has no channel to deliver a
+    background result after the turn ends, so it must always run to
+    completion regardless of this setting.
+
+    Default 600s. Set to 0 (or a negative value) to disable and restore
+    the pre-cap unbounded behavior. Returns ``None`` when unbounded.
+    """
+    cfg = _load_config()
+    val = cfg.get("sync_fallback_timeout_seconds")
+    if val is not None:
+        try:
+            parsed = float(val)
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation.sync_fallback_timeout_seconds=%r is not a valid "
+                "number; using default %ds",
+                val,
+                int(_DEFAULT_SYNC_FALLBACK_TIMEOUT),
+            )
+        else:
+            return None if parsed <= 0 else parsed
+    env_val = os.getenv("DELEGATION_SYNC_FALLBACK_TIMEOUT_SECONDS")
+    if env_val:
+        try:
+            parsed = float(env_val)
+        except (TypeError, ValueError):
+            pass
+        else:
+            return None if parsed <= 0 else parsed
+    return _DEFAULT_SYNC_FALLBACK_TIMEOUT
+
+
+# Hard ceiling on how long we wait, AFTER the primary sync_fallback_timeout
+# has already elapsed and every child has been sent interrupt(), for the
+# aggregation to actually unwind and hand back whatever partial results the
+# children produced. interrupt() only asks a child to stop at its next
+# iteration boundary — it can't force an in-flight API call to return
+# instantly — so some grace is needed for "partial results" to mean
+# anything.  This is a small, fixed budget (NOT proportional to the
+# configured timeout) so the worst-case total overrun stays bounded no
+# matter how large delegation.sync_fallback_timeout_seconds is set.
+_CAPACITY_FALLBACK_INTERRUPT_GRACE_SECONDS = 20.0
+
+
+def _run_bounded_capacity_fallback(execute_fn, child_agents, timeout_seconds):
+    """Run the pool-at-capacity inline fallback under a wall-clock bound.
+
+    ``execute_fn`` is ``_execute_and_aggregate`` bound to zero args (a
+    closure). ``timeout_seconds=None`` preserves the pre-cap behavior:
+    ``execute_fn`` runs directly on the calling thread and this function
+    blocks until it returns, identical to calling it inline.
+
+    When bounded, ``execute_fn`` runs on a one-worker daemon pool (same
+    shape as the per-child watchdog in ``_run_single_child`` and the
+    cron wall-clock watchdog in ``cron/scheduler.py``: 1-worker pool + a
+    bounded ``future.result()`` + ``agent.interrupt()`` on expiry) so a
+    hung child can't hold the parent turn open past the bound. On expiry,
+    every child in ``child_agents`` is interrupted and we wait a further
+    short, fixed grace period for the aggregation to unwind and return
+    whatever partial results the children produced before giving up and
+    returning a minimal partial-result shape.
+
+    Returns ``(result_dict, timed_out)``.
+    """
+    if timeout_seconds is None:
+        return execute_fn(), False
+
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    executor = DaemonThreadPoolExecutor(max_workers=1)
+    future = executor.submit(execute_fn)
+    try:
+        try:
+            return future.result(timeout=timeout_seconds), False
+        except FuturesTimeoutError:
+            pass
+
+        logger.warning(
+            "delegate_task: capacity fallback exceeded the %ss "
+            "sync_fallback_timeout_seconds bound; interrupting %d child(ren).",
+            timeout_seconds,
+            len(child_agents),
+        )
+        for _child in child_agents:
+            try:
+                if hasattr(_child, "interrupt"):
+                    _child.interrupt("Capacity fallback exceeded wall-clock budget")
+                elif hasattr(_child, "_interrupt_requested"):
+                    _child._interrupt_requested = True
+            except Exception:
+                logger.debug(
+                    "capacity fallback: interrupting child failed", exc_info=True
+                )
+
+        try:
+            result = future.result(
+                timeout=_CAPACITY_FALLBACK_INTERRUPT_GRACE_SECONDS
+            )
+        except FuturesTimeoutError:
+            logger.error(
+                "delegate_task: capacity fallback did not unwind within the "
+                "%ss interrupt grace period; returning an empty partial "
+                "result — the batch continues running detached in the "
+                "background but its results can no longer reach this turn.",
+                _CAPACITY_FALLBACK_INTERRUPT_GRACE_SECONDS,
+            )
+            result = {"results": [], "total_duration_seconds": timeout_seconds}
+        return result, True
+    finally:
+        # Never wait — if a child thread is stuck on blocking I/O, wait=True
+        # would hang the shutdown itself. Mirrors _run_single_child's
+        # _timeout_executor.shutdown(wait=False).
+        executor.shutdown(wait=False)
+
+
 def _get_max_spawn_depth() -> int:
     """Read delegation.max_spawn_depth from config, floored at 1 (no ceiling).
 
@@ -2890,20 +3019,40 @@ def delegate_task(
         # Pool at capacity / schedule failure — children are still attached
         # (we detach above only on the parent list, but the async unit was
         # never accepted, so re-attaching isn't needed: we just run inline).
+        # This inline run is bounded (delegation.sync_fallback_timeout_seconds,
+        # default 600s) — unlike the stateless-session fallback above, which
+        # has no channel to deliver a later result and must run unbounded.
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",
             dispatch.get("error", "rejected"),
         )
-        _cap_result = _execute_and_aggregate()
+        _cap_timeout = _get_sync_fallback_timeout()
+        _cap_result, _cap_timed_out = _run_bounded_capacity_fallback(
+            _execute_and_aggregate, _child_agents, _cap_timeout
+        )
         if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
+            if _cap_timed_out:
+                # _run_bounded_capacity_fallback only reports timed_out=True
+                # when it was actually given a numeric bound (None means
+                # "run inline, never times out" — see its docstring).
+                assert _cap_timeout is not None
+                _cap_result["note"] = (
+                    f"capacity fallback exceeded {int(_cap_timeout)}s; child "
+                    f"interrupted — results partial; raise "
+                    f"delegation.max_concurrent_children or retry later. (The "
+                    f"background delegation pool was at capacity, so the "
+                    f"subagent(s) ran SYNCHRONOUSLY and hit the "
+                    f"delegation.sync_fallback_timeout_seconds bound.)"
+                )
+            else:
+                _cap_result["note"] = (
+                    "The background delegation pool was at capacity "
+                    "(delegation.max_concurrent_children), so the subagent(s) ran "
+                    "SYNCHRONOUSLY and the result is included above. Raise "
+                    "delegation.max_concurrent_children in config.yaml to allow "
+                    "more concurrent background delegations."
+                )
         return json.dumps(_cap_result, ensure_ascii=False)
 
     # ----- Synchronous path -----

@@ -3097,5 +3097,283 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+class TestSyncFallbackTimeoutConfig(unittest.TestCase):
+    """delegation.sync_fallback_timeout_seconds — config knob bounding the
+    pool-at-capacity inline fallback (see TestCapacityFallbackBound)."""
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_default_is_600(self, _mock_cfg):
+        from tools.delegate_tool import _get_sync_fallback_timeout
+        self.assertEqual(_get_sync_fallback_timeout(), 600.0)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"sync_fallback_timeout_seconds": 45},
+    )
+    def test_explicit_positive_value_passes_through(self, _mock_cfg):
+        from tools.delegate_tool import _get_sync_fallback_timeout
+        self.assertEqual(_get_sync_fallback_timeout(), 45.0)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"sync_fallback_timeout_seconds": 0},
+    )
+    def test_zero_means_unbounded(self, _mock_cfg):
+        """0 restores the pre-cap legacy (unbounded) behavior."""
+        from tools.delegate_tool import _get_sync_fallback_timeout
+        self.assertIsNone(_get_sync_fallback_timeout())
+
+
+class TestRunBoundedCapacityFallback(unittest.TestCase):
+    """Unit tests for _run_bounded_capacity_fallback, the watchdog wrapper
+    the pool-at-capacity fallback uses to bound _execute_and_aggregate()."""
+
+    def test_none_timeout_runs_inline_on_calling_thread(self):
+        """timeout_seconds=None must be a pure passthrough: execute_fn runs
+        on the SAME thread, not a wrapped worker — proves the legacy
+        (delegation.sync_fallback_timeout_seconds=0) path adds no wrapping
+        at all, not just a very long bound."""
+        from tools.delegate_tool import _run_bounded_capacity_fallback
+
+        calling_thread = threading.current_thread()
+        seen = {}
+
+        def execute_fn():
+            seen["thread"] = threading.current_thread()
+            return {"results": ["ok"]}
+
+        result, timed_out = _run_bounded_capacity_fallback(execute_fn, [], None)
+
+        self.assertEqual(result, {"results": ["ok"]})
+        self.assertFalse(timed_out)
+        self.assertIs(seen["thread"], calling_thread)
+
+    def test_fast_execute_fn_under_bound_returns_unmodified(self):
+        from tools.delegate_tool import _run_bounded_capacity_fallback
+
+        def execute_fn():
+            return {"results": ["ok"], "total_duration_seconds": 0.01}
+
+        result, timed_out = _run_bounded_capacity_fallback(execute_fn, [], 5.0)
+
+        self.assertEqual(result, {"results": ["ok"], "total_duration_seconds": 0.01})
+        self.assertFalse(timed_out)
+
+    def test_expiry_interrupts_children_and_returns_partial_within_grace(self):
+        """A child that never finishes on its own must still cause
+        execute_fn to return once interrupt() is honored — the wrapper
+        must not simply block forever waiting for execute_fn."""
+        from tools.delegate_tool import _run_bounded_capacity_fallback
+
+        child = MagicMock()
+        interrupted = threading.Event()
+        child.interrupt.side_effect = lambda *a, **k: interrupted.set()
+
+        def execute_fn():
+            was_interrupted = interrupted.wait(timeout=5.0)
+            return {
+                "results": [
+                    {"task_index": 0, "status": "interrupted" if was_interrupted else "completed"}
+                ]
+            }
+
+        start = time.monotonic()
+        result, timed_out = _run_bounded_capacity_fallback(execute_fn, [child], 0.2)
+        elapsed = time.monotonic() - start
+
+        self.assertTrue(timed_out)
+        child.interrupt.assert_called_once()
+        # Bounded: the 0.2s primary timeout plus however long execute_fn
+        # takes to notice the interrupt and return — nowhere near the 5s
+        # hang, proving the wrapper didn't just wait the whole hang out.
+        self.assertLess(elapsed, 4.0)
+        self.assertEqual(result["results"][0]["status"], "interrupted")
+
+    def test_expiry_without_child_agents_still_returns_partial_shape(self):
+        """No live children to interrupt (already-detached / edge case) must
+        still produce a usable partial-result shape instead of raising."""
+        from tools.delegate_tool import _run_bounded_capacity_fallback
+
+        def execute_fn():
+            time.sleep(5.0)
+            return {"results": ["never seen"]}
+
+        start = time.monotonic()
+        result, timed_out = _run_bounded_capacity_fallback(execute_fn, [], 0.1)
+        elapsed = time.monotonic() - start
+
+        self.assertTrue(timed_out)
+        self.assertIsInstance(result, dict)
+        self.assertIn("results", result)
+        # Grace period (fixed, small) bounds the worst case even when
+        # nothing can be interrupted — must not silently become unbounded.
+        self.assertLess(elapsed, 25.0)
+
+
+class TestCapacityFallbackBound(unittest.TestCase):
+    """End-to-end: delegate_task's pool-at-capacity inline fallback
+    (background=True, async pool rejects) is bounded by
+    delegation.sync_fallback_timeout_seconds. Covers task T11's four
+    scenarios: hanging child, fast child (regression), timeout=0
+    (regression), and the untouched stateless-session fallback (#10760).
+    """
+
+    @staticmethod
+    def _capacity_rejected():
+        return {"status": "rejected", "error": "pool at capacity"}
+
+    @patch("tools.delegate_tool._get_sync_fallback_timeout", return_value=0.2)
+    @patch("tools.async_delegation.dispatch_async_delegation_batch")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_hanging_child_is_bounded_and_interrupted(
+        self, mock_run, mock_build, mock_dispatch, _mock_timeout
+    ):
+        mock_dispatch.return_value = self._capacity_rejected()
+        fake_child = MagicMock()
+        fake_child._delegate_role = "leaf"
+        mock_build.return_value = fake_child
+
+        interrupted = threading.Event()
+        fake_child.interrupt.side_effect = lambda *a, **k: interrupted.set()
+
+        def hanging_run(task_index, goal, child, parent_agent=None, **kw):
+            was_interrupted = interrupted.wait(timeout=5.0)
+            return {
+                "task_index": task_index,
+                "status": "interrupted" if was_interrupted else "completed",
+                "summary": "partial" if was_interrupted else "full",
+                "api_calls": 1,
+                "duration_seconds": 0.01,
+            }
+
+        mock_run.side_effect = hanging_run
+
+        parent = _make_mock_parent()
+        start = time.monotonic()
+        out = json.loads(
+            delegate_task(goal="never finishes", background=True, parent_agent=parent)
+        )
+        elapsed = time.monotonic() - start
+
+        # Bounded: nowhere near the 5s hang the child would otherwise take.
+        self.assertLess(elapsed, 4.0)
+        fake_child.interrupt.assert_called_once()
+        self.assertIn("results", out)
+        note = out.get("note", "")
+        self.assertIn("capacity fallback exceeded", note)
+        self.assertIn("interrupted", note)
+        self.assertIn("partial", note)
+        self.assertIn("delegation.max_concurrent_children", note)
+        self.assertIn("retry later", note)
+
+    @patch("tools.delegate_tool._get_sync_fallback_timeout", return_value=5.0)
+    @patch("tools.async_delegation.dispatch_async_delegation_batch")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_fast_child_under_bound_is_unaffected(
+        self, mock_run, mock_build, mock_dispatch, _mock_timeout
+    ):
+        """Regression: a child finishing well within the bound gets the
+        same result and note as before this change — no mention of
+        exceeding a budget, no interrupt."""
+        mock_dispatch.return_value = self._capacity_rejected()
+        fake_child = MagicMock()
+        fake_child._delegate_role = "leaf"
+        mock_build.return_value = fake_child
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done fast",
+            "api_calls": 1,
+            "duration_seconds": 0.01,
+        }
+
+        parent = _make_mock_parent()
+        out = json.loads(
+            delegate_task(goal="finishes fast", background=True, parent_agent=parent)
+        )
+
+        fake_child.interrupt.assert_not_called()
+        self.assertEqual(out["results"][0]["status"], "completed")
+        self.assertEqual(out["results"][0]["summary"], "done fast")
+        note = out.get("note", "")
+        self.assertNotIn("exceeded", note)
+        self.assertIn("was at capacity", note)
+        self.assertIn("SYNCHRONOUSLY", note)
+
+    @patch("tools.delegate_tool._get_sync_fallback_timeout", return_value=None)
+    @patch("tools.async_delegation.dispatch_async_delegation_batch")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_timeout_zero_is_unbounded_legacy_behavior(
+        self, mock_run, mock_build, mock_dispatch, _mock_timeout
+    ):
+        """delegation.sync_fallback_timeout_seconds=0 (getter returns None)
+        must let a slow child run to completion untouched — regression
+        guard for the pre-cap behavior."""
+        mock_dispatch.return_value = self._capacity_rejected()
+        fake_child = MagicMock()
+        fake_child._delegate_role = "leaf"
+        mock_build.return_value = fake_child
+
+        def slow_but_finishes(task_index, goal, child, parent_agent=None, **kw):
+            time.sleep(0.3)  # longer than the 0.2s bound used elsewhere
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "finished slowly",
+                "api_calls": 1,
+                "duration_seconds": 0.3,
+            }
+
+        mock_run.side_effect = slow_but_finishes
+
+        parent = _make_mock_parent()
+        out = json.loads(
+            delegate_task(goal="slow but finishes", background=True, parent_agent=parent)
+        )
+
+        fake_child.interrupt.assert_not_called()
+        self.assertEqual(out["results"][0]["status"], "completed")
+        self.assertEqual(out["results"][0]["summary"], "finished slowly")
+        note = out.get("note", "")
+        self.assertNotIn("exceeded", note)
+
+    @patch("tools.delegate_tool._get_sync_fallback_timeout", return_value=0.01)
+    @patch("tools.delegate_tool._run_bounded_capacity_fallback")
+    @patch("gateway.session_context.async_delivery_supported", return_value=False)
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_stateless_session_fallback_is_not_bounded(
+        self, mock_run, mock_build, _mock_async_ok, mock_bounded, _mock_timeout
+    ):
+        """The separate stateless-session inline fallback (#10760) — taken
+        when async_delivery_supported() is False, before the pool-capacity
+        branch is even reached — must keep its current unbounded behavior.
+        _run_bounded_capacity_fallback must never be invoked on this path,
+        even with a razor-thin sync_fallback_timeout_seconds configured."""
+        fake_child = MagicMock()
+        fake_child._delegate_role = "leaf"
+        mock_build.return_value = fake_child
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "stateless path result",
+            "api_calls": 1,
+            "duration_seconds": 0.01,
+        }
+
+        parent = _make_mock_parent()
+        out = json.loads(
+            delegate_task(goal="stateless session", background=True, parent_agent=parent)
+        )
+
+        mock_bounded.assert_not_called()
+        fake_child.interrupt.assert_not_called()
+        self.assertEqual(out["results"][0]["status"], "completed")
+        self.assertIn("background=true is not available on this endpoint", out["note"])
+
+
 if __name__ == "__main__":
     unittest.main()

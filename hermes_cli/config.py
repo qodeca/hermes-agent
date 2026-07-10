@@ -2275,6 +2275,18 @@ DEFAULT_CONFIG = {
                                        # delegation units. New async dispatches beyond the cap
                                        # fall back to synchronous execution. Floor of 1, no ceiling.
                                        # (Replaces the deprecated max_async_children.)
+        "sync_fallback_timeout_seconds": 600,  # wall-clock bound on the pool-at-capacity inline
+                                       # fallback: when background=true but max_concurrent_children
+                                       # is already saturated, delegate_task runs the batch inline
+                                       # instead of dispatching a background handle. Without a bound
+                                       # a hung child blocked the parent turn indefinitely (58 min in
+                                       # one incident, with no cap at all). On expiry the running
+                                       # child(ren) are interrupted and a partial result returns with
+                                       # an explanatory note. 0 = unbounded (pre-cap legacy behavior).
+                                       # Does NOT apply to the separate stateless-session inline
+                                       # fallback (issue #10760) — that path has no channel to
+                                       # deliver a background result later, so it must always run to
+                                       # completion regardless of this setting.
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.
