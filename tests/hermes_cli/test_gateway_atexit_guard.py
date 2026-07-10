@@ -6,9 +6,7 @@ registration path is called multiple times in the same process.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 
 def test_atexit_hook_registered_exactly_once(monkeypatch):
@@ -16,13 +14,16 @@ def test_atexit_hook_registered_exactly_once(monkeypatch):
     # Track how many times atexit.register is called with _atexit_hook
     hook_registrations = []
 
-    original_register = __import__("atexit").register
-
     def mock_register(func):
-        # Only count registrations of our specific hook function
+        # Only count registrations of our specific hook function.
+        # Deliberately do NOT forward to the real atexit.register: a real
+        # registration would fire _atexit_hook at interpreter shutdown,
+        # after the temp HERMES_HOME monkeypatch is reverted, and write a
+        # diagnostic line to the real ~/.hermes/logs/ — tests must never
+        # touch the real ~/.hermes/.
         if hasattr(func, "__name__") and func.__name__ == "_atexit_hook":
             hook_registrations.append(func)
-        return original_register(func)
+        return func
 
     # Patch functions that run_gateway calls before the atexit registration
     with patch("hermes_cli.gateway._guard_official_docker_root_gateway"), \
