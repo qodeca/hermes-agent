@@ -1605,6 +1605,16 @@ DEFAULT_CONFIG = {
             "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
             "extra_body": {},
         },
+        # Independent-summarizer escape hatch (T10): setting provider/model
+        # here to a DIFFERENT backend than the main model means a main-model
+        # outage (rate limit, capacity/overload, timeout) never takes context
+        # compression down with it — the summary call goes to a healthy
+        # endpoint instead of retrying the one that's already failing. When
+        # left at the "auto"/"" defaults, compression summarises using the
+        # main model/endpoint, so a sustained main-model fault also blocks
+        # compression (by design — see
+        # ContextCompressor.compress()'s trigger_reason handling, which
+        # aborts rather than lossily dropping context in that case).
         "compression": {
             "provider": "auto",
             "model": "",

@@ -3276,6 +3276,7 @@ def run_conversation(
                             messages, system_message,
                             approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            trigger_reason=classified.reason.value,
                         )
                         conversation_history = conversation_history_after_compression(
                             agent, messages
@@ -3530,6 +3531,7 @@ def run_conversation(
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
+                        trigger_reason=classified.reason.value,
                     )
                     conversation_history = conversation_history_after_compression(
                         agent, messages
@@ -3753,6 +3755,7 @@ def run_conversation(
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
+                        trigger_reason=classified.reason.value,
                     )
                     conversation_history = conversation_history_after_compression(
                         agent, messages

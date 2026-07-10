@@ -1141,6 +1141,190 @@ class TestSummaryFallbackToMainModel:
         assert c._summary_failure_cooldown_until == 1030.0
 
 
+class TestBackendFaultTriggerReason:
+    """T10: compression must not recover through a failing backend.
+
+    Real incident: compression's summary call reused the SAME failing
+    model/endpoint that triggered compression, failed identically, then a
+    lossy static-drop fallback dropped 85 -> 14 messages (83% context loss)
+    — all driven by a backend fault, not window pressure. ``trigger_reason``
+    lets a caller that compressed in response to a classified API error tell
+    the compressor "the backend itself is what's broken" so it neither
+    re-hits the same endpoint nor destroys context as a consolation.
+    """
+
+    def _msgs(self, n=10):
+        return [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            for i in range(n)
+        ]
+
+    def _compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="main-model",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
+    def test_backend_capacity_trigger_skips_summary_call_entirely(self):
+        """(a) trigger_reason='backend_capacity' -> zero call_llm calls, no
+        message-dropping, and a cooldown is recorded."""
+        c = self._compressor()
+        msgs = self._msgs(12)
+
+        with patch("agent.context_compressor.call_llm") as mock_call:
+            result = c.compress(
+                msgs, current_tokens=999999, force=True,
+                trigger_reason="backend_capacity",
+            )
+
+        mock_call.assert_not_called()
+        # No messages dropped — compression aborted and preserved the
+        # original transcript unchanged.
+        assert result == msgs
+        assert len(result) == len(msgs)
+        assert c._last_compress_aborted is True
+        assert c._last_summary_backend_fault is True
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+        # Cooldown recorded so subsequent auto-compress attempts back off.
+        cooldown = c.get_active_compression_failure_cooldown()
+        assert cooldown is not None
+        assert cooldown["remaining_seconds"] > 0
+
+    def test_overloaded_trigger_also_skips_summary_call(self):
+        """The 'overloaded' FailoverReason is the other backend-fault value —
+        must be treated identically to 'backend_capacity'."""
+        c = self._compressor()
+        msgs = self._msgs(12)
+
+        with patch("agent.context_compressor.call_llm") as mock_call:
+            result = c.compress(
+                msgs, current_tokens=999999, force=True,
+                trigger_reason="overloaded",
+            )
+
+        mock_call.assert_not_called()
+        assert result == msgs
+        assert len(result) == len(msgs)
+        assert c._last_compress_aborted is True
+        assert c._last_summary_backend_fault is True
+
+    def test_window_pressure_trigger_still_compresses(self):
+        """(b) Regression: trigger_reason=None (the default — every
+        window/size-threshold caller) must compress exactly as before T10."""
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "a real summary"
+
+        c = self._compressor()
+        msgs = self._msgs(12)
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_ok) as mock_call:
+            result = c.compress(
+                msgs, current_tokens=999999, force=True, trigger_reason=None,
+            )
+
+        mock_call.assert_called_once()
+        assert len(result) < len(msgs)
+        assert c._last_compress_aborted is False
+        assert c._last_summary_backend_fault is False
+
+    def test_context_overflow_trigger_still_compresses(self):
+        """Regression: a genuine window-pressure trigger_reason (real
+        context_overflow, as passed by the conversation_loop error-driven
+        call sites) must NOT be treated as a backend fault."""
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "a real summary"
+
+        c = self._compressor()
+        msgs = self._msgs(12)
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_ok) as mock_call:
+            result = c.compress(
+                msgs, current_tokens=999999, force=True,
+                trigger_reason="context_overflow",
+            )
+
+        mock_call.assert_called_once()
+        assert len(result) < len(msgs)
+        assert c._last_compress_aborted is False
+
+    def test_backend_fault_trigger_short_circuits_before_fallback_chain(self):
+        """(c) Fallback-chain interaction: even when summary_model differs
+        from the main model (the case that would normally retry on main —
+        see TestSummaryFallbackToMainModel), a backend-fault trigger_reason
+        must short-circuit BEFORE any call_llm attempt at all — the fallback
+        chain never gets a chance to run."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="distinct-aux-model",
+                quiet_mode=True,
+            )
+
+        with patch("agent.context_compressor.call_llm") as mock_call:
+            result = c._generate_summary(self._msgs(), trigger_reason="backend_capacity")
+
+        mock_call.assert_not_called()
+        assert result is None
+        assert c._last_summary_backend_fault is True
+        assert getattr(c, "_summary_model_fallen_back", False) is False
+
+    def test_fallback_chain_same_model_no_second_call_llm_attempt(self):
+        """(c) Regression, non-backend-fault path: when summary_model IS the
+        main model and the (only) attempt fails, there is nowhere to fall
+        back to — exactly one call_llm attempt, straight to cooldown. This
+        locks in the existing ``self.summary_model != self.model`` guard
+        that T10 relies on as the fallback-chain backstop."""
+        err = Exception("500 internal error")
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="main-model",  # same as main
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm", side_effect=err,
+        ) as mock_call:
+            result = c._generate_summary(self._msgs(), trigger_reason=None)
+
+        assert mock_call.call_count == 1
+        assert result is None
+        assert getattr(c, "_summary_model_fallen_back", False) is False
+        assert c._last_summary_backend_fault is False
+
+    def test_fallback_chain_distinct_healthy_summary_model_still_works(self):
+        """(d) Regression: a genuinely distinct, healthy summary_model must
+        still be tried on its own first — trigger_reason=None (window
+        pressure) does not disable the normal aux-model summary path."""
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "summary via aux model"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="healthy-aux-model",
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm", return_value=mock_ok,
+        ) as mock_call:
+            result = c._generate_summary(self._msgs(), trigger_reason=None)
+
+        mock_call.assert_called_once()
+        assert mock_call.call_args.kwargs.get("model") == "healthy-aux-model"
+        assert result is not None
+        assert "summary via aux model" in result
+
+
 class TestStreamingClosedFallback:
     """httpcore / httpx streaming premature-close errors must be classified the
     same as timeouts so the compressor retries on the main model instead of

@@ -441,6 +441,7 @@ def compress_context(
     task_id: str = "default",
     focus_topic: Optional[str] = None,
     force: bool = False,
+    trigger_reason: Optional[str] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -457,6 +458,15 @@ def compress_context(
             by the manual ``/compress`` slash command so users can retry
             immediately after an auto-compress abort.  Auto-compress
             callers use the default ``False``.
+        trigger_reason: Optional classified-error reason (a
+            ``FailoverReason.value`` string) naming why this compression was
+            invoked. ``None`` (the default, and what every pre-T10 caller
+            passes) means genuine window/size pressure. Callers that compress
+            in response to a classified API error should pass
+            ``classified.reason.value`` here so the compressor can tell a
+            backend fault (``"backend_capacity"``/``"overloaded"``) apart
+            from real context overflow — see
+            :meth:`agent.context_compressor.ContextCompressor.compress`.
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
@@ -636,10 +646,14 @@ def compress_context(
             pass
 
     try:
-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
+        compressed = agent.context_compressor.compress(
+            messages, current_tokens=approx_tokens, focus_topic=focus_topic,
+            force=force, trigger_reason=trigger_reason,
+        )
     except TypeError:
         # Plugin context engine with strict signature that doesn't accept
-        # focus_topic / force — fall back to calling without them.
+        # focus_topic / force / trigger_reason — fall back to calling
+        # without them.
         try:
             compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
         except BaseException:

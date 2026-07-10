@@ -215,6 +215,26 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
+# Cooldown applied when compression is skipped because the trigger itself was
+# a backend fault (see ``_BACKEND_FAULT_TRIGGER_REASONS``) — same order of
+# magnitude as the other transient-failure cooldowns below (timeout, JSON
+# decode, streaming close), since a backend outage is typically self-resolving
+# on a similar timescale.
+_BACKEND_FAULT_COOLDOWN_SECONDS = 60
+
+# ``trigger_reason`` values (mirroring ``agent.error_classifier.FailoverReason``
+# member names as plain strings, so ``context_compressor.py`` has no import
+# dependency on the classifier module) that mean "the error which triggered
+# this compression attempt was the backend itself failing, not window
+# pressure". When ``compress()``/``_generate_summary()`` see one of these,
+# they must NOT call the summary LLM (it would hit the identical failing
+# endpoint) and must NOT fall back to the lossy static-drop path — the
+# breaker/abort machinery upstream owns recovery for a sick backend. See
+# T10: a live incident dropped 85→14 messages (83% context loss) because
+# compression's summary call reused the same failing model/endpoint that
+# triggered it, failed identically, then fell back to dropping messages.
+_BACKEND_FAULT_TRIGGER_REASONS = frozenset({"backend_capacity", "overloaded"})
+
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to
 # become another unbounded transcript copy after the LLM summarizer failed.
@@ -1161,6 +1181,14 @@ class ContextCompressor(ContextEngine):
         # strictly better than discarding context for a transient blip
         # (#29559, #25585). Independent of abort_on_summary_failure.
         self._last_summary_network_failure: bool = False
+        # Set when compression was triggered by a backend fault (see
+        # ``_BACKEND_FAULT_TRIGGER_REASONS``) rather than window pressure.
+        # Treated the same way as an auth/network failure by ``compress()``:
+        # ABORT and preserve the session unchanged. Independent of
+        # abort_on_summary_failure — retrying against the same failing
+        # backend, or dropping context because of it, both make the
+        # incident worse.
+        self._last_summary_backend_fault: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
@@ -1748,6 +1776,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self,
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
+        trigger_reason: Optional[str] = None,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -1761,6 +1790,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 provided, the summariser prioritises preserving information
                 related to this topic and is more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
+            trigger_reason: Optional classified-error reason (a
+                ``FailoverReason.value`` string) describing why compression
+                was invoked. When it names a backend fault (see
+                ``_BACKEND_FAULT_TRIGGER_REASONS``), the summary call is
+                skipped entirely — see the guard immediately below.
 
         Returns None if all attempts fail — the caller should drop
         the middle turns without a summary rather than inject a useless
@@ -1771,6 +1805,32 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             logger.debug(
                 "Skipping context summary during cooldown (%.0fs remaining)",
                 self._summary_failure_cooldown_until - now,
+            )
+            return None
+
+        if trigger_reason in _BACKEND_FAULT_TRIGGER_REASONS:
+            # The error that triggered THIS compression attempt was the
+            # backend itself failing (a capacity/overload error), not window
+            # pressure. The summary call below would target the identical
+            # model + endpoint that just failed and fail identically — the
+            # exact incident T10 guards against (an 83% lossy context drop
+            # driven by a backend fault). Skip the call outright, record a
+            # cooldown so subsequent auto-compress attempts back off too,
+            # and flag it so ``compress()`` aborts instead of falling back to
+            # the lossy static-drop path.
+            _msg = (
+                f"compression trigger was a backend fault ({trigger_reason}) — "
+                "skipping the summary call against the same endpoint"
+            )
+            self._record_compression_failure_cooldown(
+                _BACKEND_FAULT_COOLDOWN_SECONDS, _msg,
+            )
+            self._last_summary_error = _msg
+            self._last_summary_backend_fault = True
+            logger.warning(
+                "Skipping context summary: %s. Further summary attempts "
+                "paused for %d seconds.",
+                _msg, _BACKEND_FAULT_COOLDOWN_SECONDS,
             )
             return None
 
@@ -2016,6 +2076,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_error = None
             self._last_summary_auth_failure = False
             self._last_summary_network_failure = False
+            self._last_summary_backend_fault = False
             return self._with_summary_prefix(summary)
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
@@ -2108,6 +2169,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                     self.base_url or "default",
                     e,
                 )
+            # Both fallback-to-main branches below gate on
+            # ``self.summary_model != self.model``: when the auxiliary summary
+            # model IS the main model, there is nowhere else to fall back to
+            # — retrying would just re-send the identical request to the
+            # identical endpoint that just failed. That case (and the
+            # backend-fault trigger_reason case, which short-circuits before
+            # ever reaching this method — see the guard near the top of
+            # ``_generate_summary``) both fall through to the cooldown +
+            # ``return None`` at the bottom of this except block instead.
             if (
                 (_is_model_not_found or _is_timeout or _is_json_decode or _is_streaming_closed)
                 and self.summary_model
@@ -2123,7 +2193,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 else:
                     _reason = "timed out"
                 self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+                return self._generate_summary(
+                    turns_to_summarize, focus_topic=focus_topic, trigger_reason=trigger_reason,
+                )  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
             # context is almost always worse than one extra summary attempt, so
@@ -2140,7 +2212,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 self._fallback_to_main_for_compression(e, "failed")
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+                return self._generate_summary(
+                    turns_to_summarize, focus_topic=focus_topic, trigger_reason=trigger_reason,
+                )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
             # streaming premature-close) — shorter cooldown for JSON decode and
@@ -2790,7 +2864,14 @@ This compaction should PRIORITISE preserving all information related to the focu
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False) -> List[Dict[str, Any]]:
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        focus_topic: str = None,
+        force: bool = False,
+        trigger_reason: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -2811,6 +2892,14 @@ This compaction should PRIORITISE preserving all information related to the focu
             force: If True, clear any active summary-failure cooldown before
                 running so a manual ``/compress`` can retry immediately after
                 an auto-compression abort.  Auto-compress callers pass False.
+            trigger_reason: Optional classified-error reason (a
+                ``FailoverReason.value`` string, e.g. ``"context_overflow"``,
+                ``"backend_capacity"``) describing why this compression was
+                invoked. ``None`` means "genuine window/size pressure" — the
+                default, and the only value every pre-T10 caller passes, so
+                omitting it preserves prior behavior exactly. When it names a
+                backend fault, the summary LLM call and the lossy static-drop
+                fallback are both skipped — see ``_generate_summary``.
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
@@ -2932,7 +3021,11 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 3: Generate structured summary
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
+        summary = self._generate_summary(
+            turns_to_summarize,
+            focus_topic=summary_focus_topic,
+            trigger_reason=trigger_reason,
+        )
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -2946,20 +3039,24 @@ This compaction should PRIORITISE preserving all information related to the focu
         #           surface a warning.
         # Default is False (historical behavior).
         #
-        # EXCEPTION — auth AND transient network failures always abort. A
-        # 401/403 from the summary call means the credential or endpoint is
-        # broken (invalid/blocked key, or a token pointed at the wrong
-        # inference host). A connection/stream-close error means the network
-        # blipped at the compaction moment (#29559). In BOTH cases rotating into
-        # a child session with a placeholder summary on a broken credential
-        # strands the user on a degraded session for zero benefit — every
-        # subsequent call fails the same way. So when the failure was an auth
-        # error we abort regardless of abort_on_summary_failure, preserving
-        # the conversation unchanged until the credential is fixed.
+        # EXCEPTION — auth, transient network, AND backend-fault failures
+        # always abort. A 401/403 from the summary call means the credential
+        # or endpoint is broken (invalid/blocked key, or a token pointed at
+        # the wrong inference host). A connection/stream-close error means the
+        # network blipped at the compaction moment (#29559). A backend-fault
+        # trigger_reason (T10) means the summary call was skipped outright
+        # because the SAME endpoint that triggered compression is the one
+        # that would have served the summary. In ALL these cases rotating
+        # into a child session with a placeholder summary — or dropping the
+        # middle window — strands the user on a degraded session for zero
+        # benefit — every subsequent call fails the same way. So we abort
+        # regardless of abort_on_summary_failure, preserving the conversation
+        # unchanged until the credential/backend recovers.
         if not summary and (
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
+            or self._last_summary_backend_fault
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -2982,6 +3079,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "unchanged; the session was NOT rotated. This is "
                         "transient: retry with /compress once connectivity "
                         "recovers, or continue the conversation as-is.",
+                        n_skipped,
+                    )
+                elif self._last_summary_backend_fault:
+                    logger.warning(
+                        "Compression was triggered by a backend fault — "
+                        "aborting compression instead of retrying the summary "
+                        "against the same endpoint. %d message(s) preserved "
+                        "unchanged; the session was NOT rotated. Recovery is "
+                        "owned by the API retry/breaker machinery for this turn.",
                         n_skipped,
                     )
                 else:
