@@ -1,12 +1,13 @@
 """Tests for injection scanning of curator (background-review) memory/skill
-writes before persistence (finding 17 / OWASP LLM05 memory poisoning).
+writes before persistence (OWASP LLM05 memory poisoning).
 
 The background curator writes summaries into memory/skills that re-enter
 future prompts. tools/curator_write_guard.py gates these writes -- and ONLY
 these writes -- through the same shared threat-pattern scanner used for
 interactive memory writes and skill installs (tools/threat_patterns.py,
 scope="strict"). On a hit: the write is dropped, one WARNING names the
-matched pattern, and the denial is recorded against T17's per-thread breaker
+matched pattern, and the denial is recorded against the background-review
+per-thread breaker
 (hermes_cli.plugins.record_thread_tool_denial) so repeated poisoning
 attempts abort the review fork like any other denied privileged action.
 
@@ -130,7 +131,7 @@ class TestMemoryCuratorInjectionScan:
             assert FLAGGED_CONTENT not in store.memory_entries
 
             import hermes_cli.plugins as plugins_mod
-            assert "memory:add" in plugins_mod._thread_tool_whitelist.denied_tools
+            assert "memory:add[injection-scan]" in plugins_mod._thread_tool_whitelist.denied_tools
 
             assert any(
                 FLAGGED_PATTERN_ID in rec.message and "memory:add" in rec.message
@@ -151,7 +152,7 @@ class TestMemoryCuratorInjectionScan:
             assert "original fact" in store.memory_entries
 
             import hermes_cli.plugins as plugins_mod
-            assert "memory:replace" in plugins_mod._thread_tool_whitelist.denied_tools
+            assert "memory:replace[injection-scan]" in plugins_mod._thread_tool_whitelist.denied_tools
         finally:
             clear_thread_tool_whitelist()
 
@@ -170,7 +171,8 @@ class TestMemoryCuratorInjectionScan:
             clear_thread_tool_whitelist()
 
     def test_curator_denial_breaker_trips_at_threshold(self, store):
-        """A poisoning attempt counts toward T17's breaker like any other
+        """A poisoning attempt counts toward the background-review denial
+        breaker like any other
         denied privileged action -- repeated attempts eventually abort."""
         set_thread_tool_whitelist({"memory"}, max_denials=2)
         try:
@@ -187,7 +189,8 @@ class TestMemoryCuratorInjectionScan:
     def test_interactive_write_scope_guard_no_denial_recorded(self, store):
         """Scope guard: outside the background-review fork, the NEW
         curator-specific gate must not fire at all -- no denial recorded.
-        The pre-existing unconditional memory scan (unrelated to T18) still
+        The pre-existing unconditional memory scan (unrelated to this
+        curator-specific gate) still
         rejects the content on its own, so the write does not persist
         either way, but that generic rejection is untouched, unlabeled
         behavior -- not what this scope guard is verifying."""
@@ -227,7 +230,7 @@ class TestSkillManageCuratorInjectionScan:
             assert not (skill_root / "my-skill" / "references" / "notes.md").exists()
 
             import hermes_cli.plugins as plugins_mod
-            assert "skill_manage:write_file" in plugins_mod._thread_tool_whitelist.denied_tools
+            assert "skill_manage:write_file[injection-scan]" in plugins_mod._thread_tool_whitelist.denied_tools
 
             assert any(
                 FLAGGED_PATTERN_ID in rec.message and "skill_manage:write_file" in rec.message
@@ -262,7 +265,7 @@ class TestSkillManageCuratorInjectionScan:
             assert FLAGGED_CONTENT not in skill_md.read_text(encoding="utf-8")
 
             import hermes_cli.plugins as plugins_mod
-            assert "skill_manage:patch" in plugins_mod._thread_tool_whitelist.denied_tools
+            assert "skill_manage:patch[injection-scan]" in plugins_mod._thread_tool_whitelist.denied_tools
         finally:
             clear_thread_tool_whitelist()
 
@@ -321,7 +324,7 @@ class TestSkillCreateCuratorInjectionScan:
             assert not (skill_root / "umbrella-skill").exists()
 
             import hermes_cli.plugins as plugins_mod
-            assert "skill_manage:create" in plugins_mod._thread_tool_whitelist.denied_tools
+            assert "skill_manage:create[injection-scan]" in plugins_mod._thread_tool_whitelist.denied_tools
 
             assert any(
                 FLAGGED_PATTERN_ID in rec.message and "skill_manage:create" in rec.message
@@ -371,7 +374,7 @@ class TestSkillEditCuratorInjectionScan:
             assert skill_md.read_text(encoding="utf-8") == original
 
             import hermes_cli.plugins as plugins_mod
-            assert "skill_manage:edit" in plugins_mod._thread_tool_whitelist.denied_tools
+            assert "skill_manage:edit[injection-scan]" in plugins_mod._thread_tool_whitelist.denied_tools
 
             assert any(
                 FLAGGED_PATTERN_ID in rec.message and "skill_manage:edit" in rec.message
@@ -406,7 +409,8 @@ class TestSkillEditCuratorInjectionScan:
 # memory: batch
 #
 # Without a curator gate here, batch would drop flagged content (the
-# pre-existing generic scan) but never credit T17's breaker -- unlimited
+# pre-existing generic scan) but never credit the background-review denial
+# breaker -- unlimited
 # free retries via batch specifically.
 # ---------------------------------------------------------------------------
 
@@ -429,7 +433,7 @@ class TestMemoryBatchCuratorInjectionScan:
             assert store.memory_entries == []
 
             import hermes_cli.plugins as plugins_mod
-            assert "memory:batch" in plugins_mod._thread_tool_whitelist.denied_tools
+            assert "memory:batch[injection-scan]" in plugins_mod._thread_tool_whitelist.denied_tools
 
             assert any(
                 FLAGGED_PATTERN_ID in rec.message and "memory:batch" in rec.message

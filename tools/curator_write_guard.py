@@ -12,7 +12,7 @@ Reuses the same pattern library used for memory writes and skill installs
 (``tools/threat_patterns.py``, ``scope="strict"``) rather than a new,
 possibly-drifting pattern list. On a hit: the write is dropped, one WARNING
 names the matched pattern, and the denial is recorded against the same
-per-thread breaker T17 introduced for repeated denied privileged attempts
+per-thread breaker introduced for repeated denied privileged attempts
 (``hermes_cli.plugins.record_thread_tool_denial``) -- a poisoning attempt is
 itself a denied privileged action.
 
@@ -81,7 +81,11 @@ def scan_curator_write(content: str, label: str) -> Optional[Dict[str, Any]]:
     }
     try:
         from hermes_cli.plugins import record_thread_tool_denial
-        abort_message = record_thread_tool_denial(label)
+        # Suffixed so the abort alert body ("Denied tool/action calls: ...")
+        # can tell a scan drop apart from a protected-skill refusal recorded
+        # under the same bare label (e.g. "skill_manage:patch") by
+        # tools/skill_manager_tool.py's `_deny_background_review_write`.
+        abort_message = record_thread_tool_denial(f"{label}[injection-scan]")
         if abort_message:
             result["error"] = abort_message
     except Exception:

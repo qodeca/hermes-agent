@@ -796,7 +796,7 @@ def _run_review_in_thread(
                 )
             }
             def _abort_review_on_repeated_denials(denied: List[str]) -> None:
-                """Circuit breaker (finding 16): the review fork retried
+                """Circuit breaker: the review fork retried
                 denied privileged writes unboundedly across sessions
                 (patch -> write_file -> patch variations against protected
                 skills) -- per OWASP AI Agent guidance, retry-after-denial

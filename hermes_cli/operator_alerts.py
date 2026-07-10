@@ -7,7 +7,8 @@ alerts, ...) is meant to route through — a thin, fire-and-forget wrapper
 over the delivery machinery cron already has (``cron/scheduler.py``'s
 delivery-target resolver + ``tools/send_message_tool._send_to_platform``).
 It intentionally does NOT add a new platform integration, a delivery queue,
-retries, or async — see the module docstring in the T16 task brief.
+retries, or async — kept intentionally minimal; see the rest of this
+module docstring for why.
 
 Consumer contract (READ BEFORE CHANGING THE SIGNATURE): the existing guarded
 caller, ``cron/scheduler.py::_send_reconcile_alert``, does::

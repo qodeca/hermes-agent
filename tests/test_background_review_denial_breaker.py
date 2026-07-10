@@ -1,4 +1,4 @@
-"""Tests for the background-review denial-count circuit breaker (finding 16).
+"""Tests for the background-review denial-count circuit breaker.
 
 Incident: the background curator retried denied privileged writes 11 times
 across sessions, varying its approach (patch -> write_file -> patch) but

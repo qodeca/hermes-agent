@@ -277,9 +277,10 @@ def _alert_high_severity_findings(findings: list[Finding]) -> None:
     ``send_operator_alert`` helper rate-limits identical titles for 15
     minutes, so calling it once per finding under a single fixed title
     ("security posture") would just have every finding after the first
-    silently suppressed by that rate limit — the opposite of what the T16
-    incident (warnings only ever landing in a log nobody read) is meant to
-    fix. A single alert listing every high finding says the same thing in
+    silently suppressed by that rate limit — the opposite of what fixing
+    the incident where security warnings only ever landed in a log nobody
+    read is meant to fix. A single alert listing every high finding says
+    the same thing in
     one message, which also matches what "process just started" actually
     is: one event, not N independent ones.
 

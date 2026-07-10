@@ -917,7 +917,8 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     # Curator (background-review) edits get an injection-scan gate on the
     # full replacement content. Placed after the protected-skill and
     # read-before-write guards so a guard denial isn't double-counted
-    # against T17's breaker. No-op for foreground/user-directed edits --
+    # against the background-review denial breaker. No-op for
+    # foreground/user-directed edits --
     # see tools/curator_write_guard.py.
     curator_block = _scan_curator_write(content, "skill_manage:edit")
     if curator_block:

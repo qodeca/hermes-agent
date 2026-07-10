@@ -342,7 +342,8 @@ class MemoryStore:
 
         # Curator (background-review) writes get an additional gate ahead of
         # the general scan below: on a hit it logs a WARNING naming the
-        # matched pattern and counts toward T17's denial breaker. No-op for
+        # matched pattern and counts toward the background-review denial
+        # breaker. No-op for
         # interactive writes -- see tools/curator_write_guard.py.
         curator_block = _scan_curator_write(content, "memory:add")
         if curator_block:
@@ -534,7 +535,8 @@ class MemoryStore:
                 # Curator (background-review) gate first, so a poisoning
                 # attempt via batch gets the same WARNING + denial-breaker
                 # credit as add/replace -- otherwise batch would be a free
-                # unlimited-retry path around T17's breaker. No-op for
+                # unlimited-retry path around the background-review denial
+                # breaker. No-op for
                 # interactive batches (they fall through to the generic
                 # scan below, unchanged). See tools/curator_write_guard.py.
                 curator_block = _scan_curator_write(new_content, "memory:batch")
