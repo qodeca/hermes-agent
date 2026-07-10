@@ -522,7 +522,38 @@ def _get_sync_fallback_timeout() -> Optional[float]:
 _CAPACITY_FALLBACK_INTERRUPT_GRACE_SECONDS = 20.0
 
 
-def _run_bounded_capacity_fallback(execute_fn, child_agents, timeout_seconds):
+def _snapshot_partial_results(results_ref) -> List[Dict[str, Any]]:
+    """Copy the live results accumulator for a hard-timeout partial return.
+
+    ``list(results_ref)`` relies on GIL append-atomicity (entries are only
+    ever appended fully-built); each entry is then shallow-copied with the
+    delegation-private ``_child_*`` bookkeeping keys stripped — on the
+    normal path those are popped by the hook/cost-rollup loop, which has
+    not run (and, once the run is abandoned, never will for the parent).
+    Copying also insulates the returned entries from the orphaned
+    aggregation thread mutating the originals later.
+    """
+    snapshot: List[Dict[str, Any]] = []
+    for entry in list(results_ref or []):
+        try:
+            snapshot.append(
+                {k: v for k, v in dict(entry).items() if not k.startswith("_child_")}
+            )
+        except Exception:
+            # A concurrent mutation mid-copy (rare: the orphan unwinding at
+            # this exact instant) — skip the entry rather than fail the turn.
+            logger.debug("capacity fallback: skipped unstable result entry", exc_info=True)
+    return snapshot
+
+
+def _run_bounded_capacity_fallback(
+    execute_fn,
+    child_agents,
+    timeout_seconds,
+    results_ref=None,
+    bail_event=None,
+    abandoned_event=None,
+):
     """Run the pool-at-capacity inline fallback under a wall-clock bound.
 
     ``execute_fn`` is ``_execute_and_aggregate`` bound to zero args (a
@@ -535,10 +566,16 @@ def _run_bounded_capacity_fallback(execute_fn, child_agents, timeout_seconds):
     cron wall-clock watchdog in ``cron/scheduler.py``: 1-worker pool + a
     bounded ``future.result()`` + ``agent.interrupt()`` on expiry) so a
     hung child can't hold the parent turn open past the bound. On expiry,
-    every child in ``child_agents`` is interrupted and we wait a further
-    short, fixed grace period for the aggregation to unwind and return
-    whatever partial results the children produced before giving up and
-    returning a minimal partial-result shape.
+    every child in ``child_agents`` is interrupted, ``bail_event`` is set
+    (the batch join loop inside ``_execute_and_aggregate`` watches it and
+    abandons still-pending children early), and we wait a further short,
+    fixed grace period for the aggregation to unwind and return whatever
+    partial results the children produced. If even the grace expires,
+    ``abandoned_event`` is set (the orphaned aggregation checks it and
+    skips all parent side effects when it eventually unwinds) and a
+    snapshot of ``results_ref`` — the live accumulator that
+    ``_execute_and_aggregate`` appends completed-child entries to — is
+    returned so siblings that already finished are not discarded.
 
     Returns ``(result_dict, timed_out)``.
     """
@@ -561,6 +598,10 @@ def _run_bounded_capacity_fallback(execute_fn, child_agents, timeout_seconds):
             timeout_seconds,
             len(child_agents),
         )
+        # Signal the batch join loop FIRST so it can abandon pending futures
+        # on its next 0.5s poll, then interrupt the children themselves.
+        if bail_event is not None:
+            bail_event.set()
         for _child in child_agents:
             try:
                 if hasattr(_child, "interrupt"):
@@ -577,14 +618,21 @@ def _run_bounded_capacity_fallback(execute_fn, child_agents, timeout_seconds):
                 timeout=_CAPACITY_FALLBACK_INTERRUPT_GRACE_SECONDS
             )
         except FuturesTimeoutError:
+            # Mark the run abandoned BEFORE snapshotting: when the wedged
+            # aggregation eventually unwinds it must see the flag and skip
+            # its parent-side effects (cost rollup, memory notify, hooks).
+            if abandoned_event is not None:
+                abandoned_event.set()
+            partial = _snapshot_partial_results(results_ref)
             logger.error(
                 "delegate_task: capacity fallback did not unwind within the "
-                "%ss interrupt grace period; returning an empty partial "
-                "result — the batch continues running detached in the "
-                "background but its results can no longer reach this turn.",
+                "%ss interrupt grace period; returning %d partial result(s) "
+                "— the batch continues running detached in the background "
+                "but its remaining results can no longer reach this turn.",
                 _CAPACITY_FALLBACK_INTERRUPT_GRACE_SECONDS,
+                len(partial),
             )
-            result = {"results": [], "total_duration_seconds": timeout_seconds}
+            result = {"results": partial, "total_duration_seconds": timeout_seconds}
         return result, True
     finally:
         # Never wait — if a child thread is stuck on blocking I/O, wait=True
@@ -2594,6 +2642,21 @@ def delegate_task(
     overall_start = time.monotonic()
     results = []
 
+    # Coordination flags for the bounded pool-at-capacity fallback (see
+    # _run_bounded_capacity_fallback). Both stay unset on every other path.
+    # - _fallback_bail: set when the primary sync_fallback_timeout expires;
+    #   the batch join loop below checks it (alongside the parent interrupt)
+    #   so aggregation can abandon still-pending children early instead of
+    #   waiting on a child that ignores its interrupt.
+    # - _fallback_abandoned: set when the interrupt grace period ALSO expires
+    #   and the parent turn returns without this aggregation's result. The
+    #   orphaned aggregation thread checks it before the post-completion
+    #   side-effect block so a child that unwinds minutes later cannot mutate
+    #   live parent_agent state (cost rollup, memory notify, subagent_stop
+    #   hooks) mid-a-later-turn.
+    _fallback_bail = threading.Event()
+    _fallback_abandoned = threading.Event()
+
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
     task_labels = [t["goal"][:40] for t in task_list]
@@ -2687,10 +2750,25 @@ def delegate_task(
 
                 pending = set(futures.keys())
                 while pending:
-                    if getattr(parent_agent, "_interrupt_requested", False) is True:
-                        # Parent interrupted — collect whatever finished and
-                        # abandon the rest.  Children already received the
-                        # interrupt signal; we just can't wait forever.
+                    # Two abandon triggers share one hatch: the parent turn
+                    # was interrupted, or the bounded capacity fallback's
+                    # wall-clock budget expired (_fallback_bail — deliberately
+                    # NOT parent_agent._interrupt_requested, which would
+                    # poison the parent's own turn). Either way: collect
+                    # whatever finished and abandon the rest. Children
+                    # already received the interrupt signal; we just can't
+                    # wait forever.
+                    _parent_interrupted = (
+                        getattr(parent_agent, "_interrupt_requested", False) is True
+                    )
+                    if _parent_interrupted or _fallback_bail.is_set():
+                        _abandon_error = (
+                            "Parent agent interrupted — child did not finish in time"
+                            if _parent_interrupted
+                            else "Capacity fallback exceeded its wall-clock budget "
+                            "(delegation.sync_fallback_timeout_seconds) — child "
+                            "interrupted before completing"
+                        )
                         for f in pending:
                             idx = futures[f]
                             if f.done():
@@ -2713,7 +2791,7 @@ def delegate_task(
                                     "task_index": idx,
                                     "status": "interrupted",
                                     "summary": None,
-                                    "error": "Parent agent interrupted — child did not finish in time",
+                                    "error": _abandon_error,
                                     "api_calls": 0,
                                     "duration_seconds": 0,
                                     "_child_role": getattr(
@@ -2777,6 +2855,27 @@ def delegate_task(
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
+
+        # Abandoned by the bounded capacity fallback: the parent turn already
+        # returned (with a snapshot of `results` and a timeout note), so this
+        # aggregation is running on an orphaned thread — possibly minutes
+        # later, mid-a-later-turn. Skip every parent_agent side effect
+        # (summary budget, memory notify, subagent_stop hooks, cost rollup):
+        # mutating live parent state from here would be an unsynchronized
+        # write into a turn that no longer expects us. The return value goes
+        # nowhere; keep the shape sane anyway.
+        if _fallback_abandoned.is_set():
+            logger.info(
+                "delegate_task: orphaned capacity-fallback aggregation "
+                "finished after the parent turn gave up; skipping parent "
+                "side effects (summary budget, memory notify, subagent_stop "
+                "hooks, cost rollup) for %d result(s).",
+                len(results),
+            )
+            return {
+                "results": results,
+                "total_duration_seconds": round(time.monotonic() - overall_start, 2),
+            }
 
         # Cap subagent summaries against the parent's remaining context
         # headroom (split across the batch) before they enter the parent's
@@ -3029,7 +3128,12 @@ def delegate_task(
         )
         _cap_timeout = _get_sync_fallback_timeout()
         _cap_result, _cap_timed_out = _run_bounded_capacity_fallback(
-            _execute_and_aggregate, _child_agents, _cap_timeout
+            _execute_and_aggregate,
+            _child_agents,
+            _cap_timeout,
+            results_ref=results,
+            bail_event=_fallback_bail,
+            abandoned_event=_fallback_abandoned,
         )
         if isinstance(_cap_result, dict):
             if _cap_timed_out:
@@ -3037,8 +3141,36 @@ def delegate_task(
                 # when it was actually given a numeric bound (None means
                 # "run inline, never times out" — see its docstring).
                 assert _cap_timeout is not None
+                # Hard-timeout snapshots contain only the entries the
+                # accumulator had at expiry — represent every still-missing
+                # task explicitly as an interrupted entry so the model sees
+                # the full fan-out shape, not a silently shrunken batch.
+                _cap_entries = _cap_result.setdefault("results", [])
+                _present_idx = {
+                    e.get("task_index") for e in _cap_entries if isinstance(e, dict)
+                }
+                for _i, _t, _child in children:
+                    if _i not in _present_idx:
+                        _cap_entries.append(
+                            {
+                                "task_index": _i,
+                                "status": "interrupted",
+                                "summary": None,
+                                "error": (
+                                    f"Capacity fallback exceeded "
+                                    f"{_cap_timeout:g}s (delegation."
+                                    f"sync_fallback_timeout_seconds) — child "
+                                    f"interrupted before completing"
+                                ),
+                                "api_calls": 0,
+                                "duration_seconds": 0,
+                            }
+                        )
+                _cap_entries.sort(
+                    key=lambda r: r.get("task_index", 0) if isinstance(r, dict) else 0
+                )
                 _cap_result["note"] = (
-                    f"capacity fallback exceeded {int(_cap_timeout)}s; child "
+                    f"capacity fallback exceeded {_cap_timeout:g}s; child "
                     f"interrupted — results partial; raise "
                     f"delegation.max_concurrent_children or retry later. (The "
                     f"background delegation pool was at capacity, so the "

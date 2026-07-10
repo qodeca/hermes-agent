@@ -3209,6 +3209,60 @@ class TestRunBoundedCapacityFallback(unittest.TestCase):
         # nothing can be interrupted — must not silently become unbounded.
         self.assertLess(elapsed, 25.0)
 
+    def test_hard_timeout_salvages_results_ref_and_sets_events(self):
+        """When the bound AND the grace both expire, the wrapper must return
+        a snapshot of the live results accumulator (completed siblings are
+        NOT discarded), strip delegation-private _child_* keys from the
+        copies, and set both coordination events."""
+        from tools.delegate_tool import _run_bounded_capacity_fallback
+
+        results_ref = [
+            {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "sibling finished before the hang",
+                "api_calls": 2,
+                "duration_seconds": 0.05,
+                "_child_role": "leaf",
+                "_child_cost_usd": 1.25,
+            }
+        ]
+        bail = threading.Event()
+        abandoned = threading.Event()
+
+        def execute_fn():
+            time.sleep(5.0)  # never unwinds within bound + grace
+            return {"results": ["never seen"]}
+
+        with patch(
+            "tools.delegate_tool._CAPACITY_FALLBACK_INTERRUPT_GRACE_SECONDS", 0.2
+        ):
+            start = time.monotonic()
+            result, timed_out = _run_bounded_capacity_fallback(
+                execute_fn,
+                [],
+                0.1,
+                results_ref=results_ref,
+                bail_event=bail,
+                abandoned_event=abandoned,
+            )
+            elapsed = time.monotonic() - start
+
+        self.assertTrue(timed_out)
+        self.assertLess(elapsed, 4.0)
+        self.assertTrue(bail.is_set())
+        self.assertTrue(abandoned.is_set())
+        self.assertEqual(len(result["results"]), 1)
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["summary"], "sibling finished before the hang")
+        # Private bookkeeping keys are stripped from the snapshot copies.
+        self.assertNotIn("_child_role", entry)
+        self.assertNotIn("_child_cost_usd", entry)
+        # And the snapshot holds copies: the accumulator's original entry
+        # keeps its private keys for the orphaned aggregation to consume.
+        self.assertIn("_child_role", results_ref[0])
+
 
 class TestCapacityFallbackBound(unittest.TestCase):
     """End-to-end: delegate_task's pool-at-capacity inline fallback
@@ -3373,6 +3427,177 @@ class TestCapacityFallbackBound(unittest.TestCase):
         fake_child.interrupt.assert_not_called()
         self.assertEqual(out["results"][0]["status"], "completed")
         self.assertIn("background=true is not available on this endpoint", out["note"])
+
+    @patch("tools.delegate_tool._CAPACITY_FALLBACK_INTERRUPT_GRACE_SECONDS", 1.0)
+    @patch("tools.delegate_tool._get_sync_fallback_timeout", return_value=0.2)
+    @patch("tools.async_delegation.dispatch_async_delegation_batch")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_batch_salvages_completed_sibling_on_hard_timeout(
+        self, mock_run, mock_build, mock_dispatch, _mock_timeout
+    ):
+        """Critical regression: 2-child batch, child A completes, child B
+        ignores its interrupt past the grace period. The returned results
+        must contain A's completed entry (NOT an empty list) plus an
+        interrupted entry for B, alongside the timeout note."""
+        mock_dispatch.return_value = self._capacity_rejected()
+        fake_children = []
+
+        def build_child(**kw):
+            c = MagicMock()
+            c._delegate_role = "leaf"
+            fake_children.append(c)
+            return c
+
+        mock_build.side_effect = build_child
+
+        def run_child(task_index, goal, child, parent_agent=None, **kw):
+            if task_index == 0:
+                return {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": "child A finished",
+                    "api_calls": 1,
+                    "duration_seconds": 0.01,
+                    "_child_role": "leaf",
+                }
+            time.sleep(3.0)  # child B ignores interrupt well past the grace
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "child B eventually",
+                "api_calls": 1,
+                "duration_seconds": 3.0,
+            }
+
+        mock_run.side_effect = run_child
+
+        parent = _make_mock_parent()
+        start = time.monotonic()
+        out = json.loads(
+            delegate_task(
+                tasks=[{"goal": "fast sibling"}, {"goal": "wedged child"}],
+                background=True,
+                parent_agent=parent,
+            )
+        )
+        elapsed = time.monotonic() - start
+
+        # Bounded: 0.2s budget + 1.0s grace, nowhere near B's 3s wedge.
+        self.assertLess(elapsed, 2.5)
+        note = out.get("note", "")
+        self.assertIn("capacity fallback exceeded", note)
+        # BOTH tasks are represented — the completed sibling is salvaged.
+        self.assertEqual(len(out["results"]), 2)
+        by_idx = {e["task_index"]: e for e in out["results"]}
+        self.assertEqual(by_idx[0]["status"], "completed")
+        self.assertEqual(by_idx[0]["summary"], "child A finished")
+        self.assertNotIn("_child_role", by_idx[0])
+        self.assertEqual(by_idx[1]["status"], "interrupted")
+        # Every child received the interrupt signal at budget expiry.
+        for c in fake_children:
+            c.interrupt.assert_called()
+
+    @patch("tools.delegate_tool._CAPACITY_FALLBACK_INTERRUPT_GRACE_SECONDS", 0.3)
+    @patch("tools.delegate_tool._get_sync_fallback_timeout", return_value=0.2)
+    @patch("tools.async_delegation.dispatch_async_delegation_batch")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_late_side_effects_suppressed_after_abandon(
+        self, mock_run, mock_build, mock_dispatch, _mock_timeout
+    ):
+        """When the wedged child finally returns AFTER the turn gave up, the
+        orphaned aggregation thread must NOT mutate live parent state (cost
+        rollup, memory notify, summary budget, hooks)."""
+        mock_dispatch.return_value = self._capacity_rejected()
+        fake_child = MagicMock()
+        fake_child._delegate_role = "leaf"
+        mock_build.return_value = fake_child
+
+        release = threading.Event()
+        orphan_returned = threading.Event()
+
+        def wedged_then_returns(task_index, goal, child, parent_agent=None, **kw):
+            release.wait(timeout=10.0)  # ignores interrupt; released by the test
+            orphan_returned.set()
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "late result",
+                "api_calls": 1,
+                "duration_seconds": 1.0,
+                "_child_cost_usd": 2.0,  # would be rolled into the parent
+            }
+
+        mock_run.side_effect = wedged_then_returns
+
+        parent = _make_mock_parent()
+        parent.session_estimated_cost_usd = 5.0  # concrete, not auto-MagicMock
+
+        with patch("tools.delegate_tool._apply_summary_budget") as mock_budget:
+            out = json.loads(
+                delegate_task(goal="wedged child", background=True, parent_agent=parent)
+            )
+            # Turn already returned with the timeout note; now let the
+            # wedged child unwind on its orphaned thread.
+            self.assertIn("capacity fallback exceeded", out.get("note", ""))
+            release.set()
+            self.assertTrue(orphan_returned.wait(timeout=5.0))
+            time.sleep(0.5)  # let the orphaned aggregation tail run
+
+            # No parent mutations from the orphan: cost untouched, summary
+            # budget never applied, memory provider never notified.
+            self.assertEqual(parent.session_estimated_cost_usd, 5.0)
+            mock_budget.assert_not_called()
+            parent._memory_manager.on_delegation.assert_not_called()
+
+    @patch("tools.delegate_tool._CAPACITY_FALLBACK_INTERRUPT_GRACE_SECONDS", 2.0)
+    @patch("tools.delegate_tool._get_sync_fallback_timeout", return_value=0.2)
+    @patch("tools.async_delegation.dispatch_async_delegation_batch")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_bail_signal_lets_batch_loop_abandon_early(
+        self, mock_run, mock_build, mock_dispatch, _mock_timeout
+    ):
+        """On budget expiry the batch join loop's early-abandon hatch fires
+        via the dedicated bail flag — NOT via parent_agent._interrupt_requested
+        (which would poison the parent's own turn). Proven by the entries'
+        error text: only the loop's abandon branch writes the
+        'wall-clock budget' message; call-site fabrication says
+        'before completing' with the seconds value."""
+        mock_dispatch.return_value = self._capacity_rejected()
+        mock_build.side_effect = lambda **kw: MagicMock(_delegate_role="leaf")
+
+        def wedged(task_index, goal, child, parent_agent=None, **kw):
+            time.sleep(3.0)  # both children ignore interrupt
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "too late",
+                "api_calls": 1,
+                "duration_seconds": 3.0,
+            }
+
+        mock_run.side_effect = wedged
+
+        parent = _make_mock_parent()
+        parent._interrupt_requested = False
+        out = json.loads(
+            delegate_task(
+                tasks=[{"goal": "wedged 1"}, {"goal": "wedged 2"}],
+                background=True,
+                parent_agent=parent,
+            )
+        )
+
+        self.assertEqual(len(out["results"]), 2)
+        for entry in out["results"]:
+            self.assertEqual(entry["status"], "interrupted")
+            # Loop-branch message → the hatch fired inside the join loop
+            # (generous 2s grace gave the loop time to bail on its own).
+            self.assertIn("wall-clock budget", entry["error"])
+        # The parent's own interrupt flag was never touched.
+        self.assertIs(parent._interrupt_requested, False)
 
 
 if __name__ == "__main__":
