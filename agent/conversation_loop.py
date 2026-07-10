@@ -2628,6 +2628,28 @@ def run_conversation(
                     agent, "_max_consecutive_api_failures", 10
                 )
                 if _breaker_limit > 0 and consecutive_api_failures >= _breaker_limit:
+                    # A pending user interrupt outranks the breaker.  The
+                    # interruptible call wrapper converts interrupts raised
+                    # DURING the API call, and the retry path re-checks the
+                    # flag further below — but a flag set between the raise
+                    # and this trip check would otherwise be swallowed by the
+                    # ``failed=True`` return, never cleared, and instantly
+                    # abort the NEXT turn at the top-of-loop interrupt check.
+                    # Exit exactly like the established in-handler interrupt
+                    # path (same shape, flag cleared).
+                    if agent._interrupt_requested:
+                        agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
+                        _interrupt_text = f"Operation interrupted: handling API error ({type(api_error).__name__}: {agent._clean_error_message(str(api_error))})."
+                        close_interrupted_tool_sequence(messages, _interrupt_text)
+                        agent._persist_session(messages, conversation_history)
+                        agent.clear_interrupt()
+                        return {
+                            "final_response": _interrupt_text,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "interrupted": True,
+                        }
                     agent._flush_status_buffer()
                     _breaker_summary = agent._summarize_api_error(api_error)
                     _breaker_response = (
@@ -2650,7 +2672,20 @@ def run_conversation(
                         classified.reason.value, _breaker_limit,
                         _breaker_summary,
                     )
-                    agent._persist_session(messages, conversation_history)
+                    # Skip session persistence when the error is likely
+                    # context-overflow related (status 400 + large session):
+                    # persisting the failed user message would make the
+                    # session even larger, causing the same failure on the
+                    # next attempt. Mirrors the non-retryable client-error
+                    # exit below. (#1630)
+                    if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
+                        agent._vprint(
+                            f"{agent.log_prefix}⚠️  Skipping session persistence "
+                            f"for large failed session to prevent growth loop.",
+                            force=True,
+                        )
+                    else:
+                        agent._persist_session(messages, conversation_history)
                     return {
                         "final_response": _breaker_response,
                         "messages": messages,

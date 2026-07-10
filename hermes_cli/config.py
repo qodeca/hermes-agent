@@ -1010,7 +1010,10 @@ DEFAULT_CONFIG = {
         # recovery all reset the per-cycle retry counter, so a
         # deterministically failing backend can otherwise keep a session
         # spinning for hours).  The counter resets to 0 on any successful
-        # API response.  0 = disabled.
+        # API response.  Note: failed calls during credential-pool rotation
+        # count too — in a rate-limit storm, a pool with more entries than
+        # this threshold aborts at the threshold before trying them all;
+        # raise the knob if you run large pools.  0 = disabled.
         "max_consecutive_api_failures": 10,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the

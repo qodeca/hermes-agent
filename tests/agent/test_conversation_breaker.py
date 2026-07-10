@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Callable, Optional
 
 import pytest
 
@@ -77,6 +78,10 @@ class _MockHandler(BaseHTTPRequestHandler):
     # failing backend" doesn't need a pre-sized queue).
     response_queue: list = []
     default_response: dict = {}
+    # Optional hook called with the 1-based chat-request index before the
+    # response is sent — lets a test flip agent state (e.g. request an
+    # interrupt) at an exact point in the failure sequence.
+    on_chat_request: Optional[Callable[[int], None]] = None
 
     def do_POST(self):  # noqa: N802 (http.server API)
         length = int(self.headers.get("Content-Length", 0))
@@ -90,6 +95,9 @@ class _MockHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         type(self).captured_requests.append(req)
+        _hook = type(self).on_chat_request
+        if _hook is not None:
+            _hook(len(type(self).captured_requests))
         if type(self).response_queue:
             resp = type(self).response_queue.pop(0)
         else:
@@ -148,6 +156,7 @@ def agent_env(monkeypatch):
     _MockHandler.captured_requests = []
     _MockHandler.response_queue = []
     _MockHandler.default_response = {}
+    _MockHandler.on_chat_request = None
     srv = HTTPServer(("127.0.0.1", 0), _MockHandler)
     port = srv.server_address[1]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -269,6 +278,51 @@ def test_success_resets_breaker_counter(agent_env):
     assert "failing repeatedly" in result["final_response"]
     # 2 failures + 1 success (reset) + 4 fresh failures to trip.
     assert len(handler.captured_requests) == 2 + 1 + 4
+
+
+def test_pending_interrupt_wins_over_breaker_trip(agent_env):
+    """If an interrupt is already pending when the threshold-tripping failure
+    is classified, the turn must exit via the interrupt path (interrupted,
+    flag cleared) — not as a breaker failure. A stale flag would otherwise
+    instantly abort the NEXT run_conversation at the top-of-loop check.
+
+    The window under test is narrow: an interrupt raised DURING the API call
+    is already converted to InterruptedError by the interruptible call
+    wrapper, so to land the flag between "exception raised" and "breaker
+    check" deterministically we set it from the api_request_error hook,
+    which the loop invokes immediately before the breaker branch."""
+    agent, handler = agent_env
+    handler.default_response = _server_error()
+    agent._api_max_retries = 10
+    agent._max_consecutive_api_failures = 2
+
+    _orig_hook = agent._invoke_api_request_error_hook
+    _calls = {"n": 0}
+
+    def _hook_and_interrupt(*args, **kwargs):
+        _calls["n"] += 1
+        if _calls["n"] == 2:  # the threshold-tripping failure
+            agent._interrupt_requested = True
+        return _orig_hook(*args, **kwargs)
+
+    agent._invoke_api_request_error_hook = _hook_and_interrupt
+
+    result = agent.run_conversation("hello", conversation_history=[], task_id="t")
+
+    assert result.get("interrupted") is True
+    assert result.get("failed") is not True
+    assert "failing repeatedly" not in (result.get("final_response") or "")
+    assert agent._interrupt_requested is False  # flag cleared
+
+    # The next turn must run normally, not abort instantly on a stale flag.
+    handler.on_chat_request = None
+    handler.default_response = _text_resp("second turn ok")
+    before = len(handler.captured_requests)
+    result2 = agent.run_conversation("again", conversation_history=[], task_id="t")
+
+    assert result2.get("interrupted") is not True
+    assert len(handler.captured_requests) > before  # an API call was made
+    assert "second turn ok" in (result2.get("final_response") or "")
 
 
 def test_threshold_zero_disables_breaker(agent_env):
