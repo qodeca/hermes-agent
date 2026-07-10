@@ -20,9 +20,11 @@ first tick. It considers two independent kinds of orphan:
 
 Multi-process hazard (#59229, cron/jobs.py ~L1834-1836): gateway and desktop
 may both run in-process tickers against one HERMES_HOME. A marker/claim is
-reapable only if it is TTL-expired OR stamped with this process's own
-``_machine_id()``; a FRESH marker from a foreign machine-id is a live run in
-another process and must be left untouched.
+reapable only if it is TTL-expired OR its ``by`` HOST PREFIX (everything
+before the last ":", i.e. minus the pid suffix ``_machine_id()`` appends when
+HERMES_MACHINE_ID is unset) matches this process's own; a FRESH marker whose
+host prefix does not match is a live run in another process and must be left
+untouched.
 
 Covers:
   (a) a running_marker 3h old (TTL-expired, foreign machine-id) -> reconciled
@@ -31,6 +33,11 @@ Covers:
       reconciled (same-machine restart implies whatever fired it is gone);
   (c) a fresh running_marker from a foreign machine-id -> untouched (live run
       elsewhere);
+  (c2) host-prefix specifics (TestHostPrefixReap): stamper/reconciler
+      differing ONLY by pid on the same host -> reconciled even when fresh
+      (the actual production bug this fix closes); a different host ->
+      untouched; distinct pinned HERMES_MACHINE_ID values on one host ->
+      treated as foreign;
   (d) a stale one-shot run_claim whose retry budget is exhausted -> reconciled
       to error (the T2-reviewer boundary: the due-scan would otherwise
       silently pop this job with no recorded error);
@@ -44,6 +51,8 @@ Covers:
       does, with no code change required here.
 """
 import logging
+import os
+import socket
 import sys
 import threading
 import time
@@ -67,7 +76,16 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def own_machine_id(monkeypatch):
-    """Pin _machine_id() to a deterministic value for own-vs-foreign assertions."""
+    """Pin _machine_id() to a deterministic, IDENTICAL value on both the
+    "stamper" (marker's ``by``) and the "reconciler" (``_machine_id()``
+    itself, via the env var) sides. Only exercises the same-literal-string
+    case (env override, or two processes independently pinned to the same
+    id) — it deliberately does NOT cover the differs-only-by-pid production
+    scenario (unset HERMES_MACHINE_ID, ``f"{host}:{pid}"``, restart gets a
+    new pid), since reusing one pinned string for both sides would mask
+    that. See TestHostPrefixReap below, which derives real host:pid-shaped
+    ids per side instead of reusing this fixture.
+    """
     monkeypatch.setenv("HERMES_MACHINE_ID", "this-host:111")
     return "this-host:111"
 
@@ -164,6 +182,69 @@ class TestRunningMarkerReconciliation:
         assert after["running_marker"] == fresh_foreign_marker
         assert after["last_status"] == "running"
         assert after.get("last_run_at") is None
+
+
+class TestHostPrefixReap:
+    """``_stamp_is_reapable`` compares the HOST PREFIX of ``by`` (everything
+    before the last ":"), not the full string. This is what makes own-machine
+    reap work at all in production: ``_machine_id()`` embeds ``os.getpid()``
+    when HERMES_MACHINE_ID is unset, so a restarted gateway process — a new
+    pid every time — could never match its crashed predecessor's stamp under
+    exact-string equality. These tests derive real ``host:pid``-shaped ids
+    (not the ``own_machine_id`` fixture's single shared literal) so the
+    pid-differs-but-host-matches case is actually exercised.
+    """
+
+    def test_stamp_and_reconciler_differing_only_by_pid_same_host_is_reconciled(
+        self, tmp_cron_dir, monkeypatch,
+    ):
+        """The actual bug this fix closes: same host, HERMES_MACHINE_ID unset
+        on both the dead incarnation and the restarted one, pids differ. Must
+        be reaped even though the marker is fresh."""
+        monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
+        host = socket.gethostname()
+        dead_incarnation_id = f"{host}:{os.getpid() + 1}"  # a pid that is not ours
+        fresh_marker = {"at": j._hermes_now().isoformat(), "by": dead_incarnation_id}
+        j.save_jobs([_recurring_job(running_marker=fresh_marker, last_status="running")])
+
+        reconciled = s.reconcile_orphaned_runs()  # reconciles as the current process/pid
+
+        assert reconciled == ["rec1"]
+        after = j.get_job("rec1")
+        assert after["running_marker"] is None
+        assert after["last_status"] == "error"
+
+    def test_different_host_fresh_is_untouched(self, tmp_cron_dir, monkeypatch):
+        """Host segment differs (pid happens to coincide) — a different host
+        can never be this process's crashed predecessor, so it stays."""
+        monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
+        fresh_marker = {
+            "at": j._hermes_now().isoformat(),
+            "by": f"some-other-host:{os.getpid()}",
+        }
+        j.save_jobs([_recurring_job(running_marker=fresh_marker, last_status="running")])
+
+        reconciled = s.reconcile_orphaned_runs()
+
+        assert reconciled == []
+        assert j.get_job("rec1")["running_marker"] == fresh_marker
+
+    def test_distinct_pinned_machine_ids_on_one_host_are_treated_as_foreign(
+        self, tmp_cron_dir, monkeypatch,
+    ):
+        """Operators running more than one Hermes process on one host against
+        a shared HERMES_HOME (e.g. gateway + desktop) opt out of cross-reap
+        by pinning distinct HERMES_MACHINE_ID values. Neither pinned id here
+        has a ':' suffix to strip, so each compares as its whole string and
+        they never collide, even though they're "the same host"."""
+        monkeypatch.setenv("HERMES_MACHINE_ID", "hermes-desktop")
+        fresh_marker = {"at": j._hermes_now().isoformat(), "by": "hermes-gateway"}
+        j.save_jobs([_recurring_job(running_marker=fresh_marker, last_status="running")])
+
+        reconciled = s.reconcile_orphaned_runs()
+
+        assert reconciled == []
+        assert j.get_job("rec1")["running_marker"] == fresh_marker
 
 
 class TestOneShotRunClaimReconciliation:

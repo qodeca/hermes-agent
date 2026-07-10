@@ -431,29 +431,46 @@ def _stamp_is_reapable(
     """Whether a running_marker/run_claim timestamp may be reaped at startup.
 
     Reapable when EITHER:
-      - it is stamped with this process's own ``_machine_id()`` — a
-        same-machine restart means whatever fired it is gone (this process
-        IS the restart), or
+      - its "by" HOST PREFIX matches ``own_machine_id``'s host prefix — see
+        below for why this is prefix matching, not exact-string equality, or
       - it is older than the run-claim TTL (``_run_claim_ttl_seconds`` — the
         same staleness bound ``_get_due_jobs_locked`` already uses for
         one-shot run_claim recovery): the claiming tick died mid-run.
 
-    A FRESH marker/claim from a FOREIGN machine-id is left untouched. The
-    gateway and desktop app may both run in-process tickers against one
-    HERMES_HOME (cron/jobs.py, #59229) — a fresh foreign stamp means a run is
-    legitimately in flight in that other process right now.
+    Host-prefix matching, not exact equality: when ``HERMES_MACHINE_ID`` is
+    unset, ``_machine_id()`` returns ``f"{host}:{pid}"``. A restarted gateway
+    gets a brand-new pid every time, so the crashed predecessor's stamp and
+    the restarted process's own id NEVER match on exact string equality —
+    reconciliation would then silently do nothing until the marker aged past
+    the TTL (>=5400s by default). Comparing everything before the LAST ":"
+    (the host, with the pid suffix stripped) fixes that: a same-host restart
+    reaps its predecessor's marker immediately, regardless of pid. A stamp or
+    id with no ":" at all (e.g. an operator-pinned ``HERMES_MACHINE_ID`` with
+    no colon) compares as its whole string, so two identical pinned ids still
+    match and two distinct ones never do.
 
-    KNOWN LIMITATION (accepted trade-off from design review): ``_machine_id()``
-    identifies the machine/user, not the process — two processes on the same
-    machine (e.g. gateway + desktop) share it. So a same-machine gateway
-    restart can reap a live desktop run's marker (or vice versa) at boot.
-    There is no cheap way to tell "my previous incarnation died" from "my
-    sibling process on this machine is still running" without a per-process
-    id that would itself need to survive the crash to be checked against —
-    which defeats the purpose. Accepted for now; a future revision could add
-    a process-scoped lease if this proves to matter in practice.
+    A FRESH marker/claim whose host prefix does NOT match ``own_machine_id``
+    is left untouched. The gateway and desktop app may both run in-process
+    tickers against one HERMES_HOME (cron/jobs.py, #59229) — a fresh, distinct
+    stamp means a run is legitimately in flight in that other process now.
+
+    KNOWN LIMITATION (real, not just theoretical, under host-prefix
+    matching): matching on host prefix is NOT process-specific. Two Hermes
+    processes on the SAME host with HERMES_MACHINE_ID unset (e.g. gateway +
+    desktop app, both sharing one HERMES_HOME) produce ids that differ only
+    by pid — the very difference this function now deliberately ignores. So
+    a same-machine gateway restart CAN reap a live desktop run's marker (or
+    vice versa) at boot: this function cannot distinguish "my previous
+    incarnation died" from "my sibling process on this host is still
+    running" without a per-process lease that would itself need to survive
+    the crash to be checked against, which defeats the purpose. Operators
+    running more than one Hermes process on one host against a shared
+    HERMES_HOME should set distinct ``HERMES_MACHINE_ID`` values (colon-free,
+    e.g. ``HERMES_MACHINE_ID=desktop`` / ``HERMES_MACHINE_ID=gateway``) so
+    each process's stamps are scoped away from the other's reaping.
     """
-    if stamp.get("by") == own_machine_id:
+    stamp_by = stamp.get("by") or ""
+    if stamp_by.rsplit(":", 1)[0] == own_machine_id.rsplit(":", 1)[0]:
         return True
     try:
         stamped_at = _ensure_aware(datetime.fromisoformat(stamp["at"]))
