@@ -796,7 +796,13 @@ def init_agent(
             # the third-party identity-injection bug.
             from agent.anthropic_adapter import _is_oauth_token as _is_oat
             agent._is_anthropic_oauth = _is_oat(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
-            agent._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout)
+            # Resolve through the same config -> HERMES_API_TIMEOUT -> 1800s
+            # chain as the rebuild/swap/refresh sites (run_agent.py's
+            # _resolved_api_call_timeout()) so the initial client's timeout
+            # doesn't silently double relative to a later credential refresh.
+            agent._anthropic_client = build_anthropic_client(
+                effective_key, base_url, timeout=agent._resolved_api_call_timeout()
+            )
             # No OpenAI client needed for Anthropic mode
             agent.client = None
             agent._client_kwargs = {}

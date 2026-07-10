@@ -1284,9 +1284,13 @@ class AIAgent:
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             # Local endpoints have historically disabled the stale-call
             # detector outright (no cloud-gateway idle-kill risk to guard
-            # against). A fully-unguarded call is never acceptable though —
-            # a hung local backend still needs a ceiling, just a generous
-            # one — so floor at 900s instead of float("inf").
+            # against). Non-stream calls always get a finite ceiling now —
+            # a hung local backend still needs one, just a generous one —
+            # so floor at 900s instead of float("inf"). (The streaming
+            # path has its own inter-chunk stale detector that still
+            # returns inf for local endpoints by design: inter-chunk
+            # activity resets the clock, so a genuinely hung stream is
+            # still caught without a fixed ceiling.)
             return max(stale_base, 900.0)
 
         from agent.chat_completion_helpers import estimate_request_context_tokens

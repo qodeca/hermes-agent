@@ -11,6 +11,13 @@ from unittest.mock import patch
 
 def test_atexit_hook_registered_exactly_once(monkeypatch):
     """Calling run_gateway twice should register the atexit hook only once."""
+    # Reset the module-level once-guard so an earlier test (or an earlier
+    # call in this same process) that already tripped it can't make this
+    # test pass vacuously by finding the guard pre-set.
+    import hermes_cli.gateway
+
+    monkeypatch.setattr(hermes_cli.gateway, "_atexit_hook_registered", False)
+
     # Track how many times atexit.register is called with _atexit_hook
     hook_registrations = []
 

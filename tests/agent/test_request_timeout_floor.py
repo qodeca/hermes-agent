@@ -1,32 +1,39 @@
 """Tests for the mandatory request-timeout floor (T7, findings 4 & 23).
 
-Production incident: a model API call ran 46 minutes with no client
-timeout. Root causes:
+This change routes Anthropic client-build timeouts through hermes's own
+config -> ``HERMES_API_TIMEOUT`` -> 1800s chain instead of the adapter's
+hardcoded fallback, and makes the initial build consistent with rebuilds:
 
-1. Three Anthropic client-build sites in ``run_agent.py``
-   (``_try_refresh_anthropic_client_credentials``, ``_swap_credential``,
-   ``_rebuild_anthropic_client``) passed the raw
-   ``get_provider_request_timeout()`` getter straight to
-   ``build_anthropic_client(..., timeout=...)``. That getter returns
+1. Four Anthropic client-build sites — the initial build in
+   ``init_agent`` (``agent/agent_init.py``, called from
+   ``AIAgent.__init__``) plus the three rebuild/swap/refresh sites in
+   ``run_agent.py`` (``_try_refresh_anthropic_client_credentials``,
+   ``_swap_credential``, ``_rebuild_anthropic_client``) — used to disagree
+   on where an unconfigured timeout bottoms out. The rebuild/swap/refresh
+   sites passed the raw ``get_provider_request_timeout()`` getter straight
+   to ``build_anthropic_client(..., timeout=...)``; that getter returns
    ``None`` whenever the provider config sets no
-   ``request_timeout_seconds`` / ``timeout_seconds`` — its contract is
-   intentionally "None when unset" because other consumers rely on that
-   meaning. Routing it *unresolved* into a client builder means an
-   unconfigured provider gets whatever bare-``None`` fallback the SDK
-   plumbing happens to apply, instead of hermes's own config -> env ->
-   1800s default chain (``AIAgent._resolved_api_call_timeout()``).
+   ``request_timeout_seconds`` / ``timeout_seconds`` (intentionally, since
+   other consumers rely on that "None when unset" contract), so an
+   unconfigured provider got whatever the adapter's own hardcoded 900s
+   fallback applied (``agent/anthropic_adapter.py``). The initial build
+   passed the same raw getter too, so credentials that refresh mid-
+   conversation silently doubled the effective timeout relative to the
+   client the conversation started with. All four sites now resolve
+   through ``AIAgent._resolved_api_call_timeout()``.
 
 2. ``AIAgent._compute_non_stream_stale_timeout`` returned ``float("inf")``
    (no stale-call detection at all) whenever the stale-timeout base was
    the implicit default *and* the endpoint looked local. A finite,
-   generous ceiling should apply instead so no call is ever fully
-   unguarded.
+   generous ceiling should apply instead so no non-stream call is ever
+   fully unguarded.
 
-These tests pin: (a) all three Anthropic client-build sites route their
+These tests pin: (a) all four Anthropic client-build sites route their
 ``timeout=`` kwarg through ``self._resolved_api_call_timeout()``, so an
 unconfigured provider gets the 1800s floor (or the configured value, when
-set) rather than a bare ``None``; (b) the stale-timeout detector's
-implicit-default/local-endpoint case returns a finite ceiling.
+set) rather than the adapter's hardcoded 900s fallback; (b) the
+stale-timeout detector's implicit-default/local-endpoint case returns a
+finite ceiling.
 """
 
 from __future__ import annotations
@@ -214,10 +221,64 @@ providers:
         assert captured["timeout"] == 45.0
 
 
+class TestInitialAnthropicClientBuildTimeoutFloor:
+    """``init_agent`` (agent/agent_init.py ~L799) — the initial client build
+    at ``AIAgent.__init__`` time, as distinct from the rebuild/swap/refresh
+    sites above. Must resolve through the same config -> HERMES_API_TIMEOUT
+    -> 1800s chain, otherwise the effective timeout silently doubles (or
+    reverts to the adapter's hardcoded 900s default) once credentials
+    refresh mid-conversation and swap in the rebuilt client.
+    """
+
+    def _build(self, captured: dict):
+        from run_agent import AIAgent
+
+        def _fake_build(api_key, base_url, timeout=None, **kw):
+            captured["timeout"] = timeout
+            return MagicMock()
+
+        with patch("agent.anthropic_adapter.build_anthropic_client", _fake_build):
+            return AIAgent(
+                model="claude-opus-4-7",
+                provider="anthropic",
+                api_key="sk-ant-test",
+                base_url="https://api.anthropic.com",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cli",
+            )
+
+    def test_no_config_gets_1800s_floor_not_none(self, monkeypatch, tmp_path):
+        _isolate_config(monkeypatch, tmp_path)
+        captured = {}
+
+        self._build(captured)
+
+        assert captured["timeout"] is not None
+        assert captured["timeout"] == 1800.0
+
+    def test_configured_provider_timeout_wins(self, monkeypatch, tmp_path):
+        _isolate_config(
+            monkeypatch,
+            tmp_path,
+            """\
+providers:
+  anthropic:
+    request_timeout_seconds: 45
+""",
+        )
+        captured = {}
+
+        self._build(captured)
+
+        assert captured["timeout"] == 45.0
+
+
 # ── Finding 23: no fully-unguarded stale-call detector ──────────────────────
 
 
-def _make_local_agent(tmp_path: Path, **overrides):
+def _make_local_agent(**overrides):
     from run_agent import AIAgent
 
     kwargs = dict(
@@ -244,7 +305,7 @@ class TestStaleTimeoutNeverFullyUnguarded:
         monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
         _write_config(tmp_path, "")
 
-        agent = _make_local_agent(tmp_path)
+        agent = _make_local_agent()
         base, implicit = agent._resolved_api_call_stale_timeout_base()
         assert base == 90.0
         assert implicit is True
@@ -268,10 +329,6 @@ providers:
 """,
         )
 
-        import importlib
-        from hermes_cli import timeouts as to_mod
-        importlib.reload(to_mod)
-
-        agent = _make_local_agent(tmp_path)
+        agent = _make_local_agent()
         timeout = agent._compute_non_stream_stale_timeout({"input": "hi"})
         assert timeout == 30.0
