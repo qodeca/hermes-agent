@@ -839,6 +839,17 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             "error": f"A skill named '{name}' already exists at {existing['path']}."
         }
 
+    # Curator (background-review) creates get an injection-scan gate on the
+    # full SKILL.md content -- create is curator-reachable (the review
+    # whitelist is tool-name level and the curator prompt explicitly asks
+    # for new umbrella skills), so without this the primary poisoning
+    # vector stays open. Placed before mkdir so a dropped create leaves no
+    # empty directory behind. No-op for foreground/user-directed creates --
+    # see tools/curator_write_guard.py.
+    curator_block = _scan_curator_write(content, "skill_manage:create")
+    if curator_block:
+        return curator_block
+
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -902,6 +913,15 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     )
     if read_guard:
         return read_guard
+
+    # Curator (background-review) edits get an injection-scan gate on the
+    # full replacement content. Placed after the protected-skill and
+    # read-before-write guards so a guard denial isn't double-counted
+    # against T17's breaker. No-op for foreground/user-directed edits --
+    # see tools/curator_write_guard.py.
+    curator_block = _scan_curator_write(content, "skill_manage:edit")
+    if curator_block:
+        return curator_block
 
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None

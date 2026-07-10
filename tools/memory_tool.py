@@ -531,6 +531,15 @@ class MemoryStore:
             act = (op or {}).get("action")
             new_content = (op or {}).get("content")
             if act in {"add", "replace"} and new_content:
+                # Curator (background-review) gate first, so a poisoning
+                # attempt via batch gets the same WARNING + denial-breaker
+                # credit as add/replace -- otherwise batch would be a free
+                # unlimited-retry path around T17's breaker. No-op for
+                # interactive batches (they fall through to the generic
+                # scan below, unchanged). See tools/curator_write_guard.py.
+                curator_block = _scan_curator_write(new_content, "memory:batch")
+                if curator_block:
+                    return curator_block
                 scan_error = _scan_memory_content(new_content)
                 if scan_error:
                     return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}

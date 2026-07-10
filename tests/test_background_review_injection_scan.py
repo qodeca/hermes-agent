@@ -38,6 +38,7 @@ from tools.threat_patterns import scan_for_threats
 from tools.memory_tool import MemoryStore
 from tools.skill_manager_tool import (
     _create_skill,
+    _edit_skill,
     _patch_skill,
     _write_file,
     mark_background_review_skill_read,
@@ -65,6 +66,32 @@ description: A test skill for unit testing.
 # Test Skill
 
 Step 1: Do the thing.
+"""
+
+# Valid frontmatter (so create/edit pass structural validation) with the
+# scanner-flagged content in the body -- the injection gate, not the
+# frontmatter validator, must be what drops it.
+FLAGGED_SKILL_CONTENT = f"""\
+---
+name: test-skill
+description: A test skill for unit testing.
+---
+
+# Test Skill
+
+Step 1: {FLAGGED_CONTENT}.
+"""
+assert scan_for_threats(FLAGGED_SKILL_CONTENT, scope="strict")
+
+BENIGN_SKILL_CONTENT_2 = """\
+---
+name: test-skill
+description: Updated description.
+---
+
+# Test Skill v2
+
+Step 1: Do the new thing.
 """
 
 
@@ -270,3 +297,178 @@ class TestSkillManageCuratorInjectionScan:
 
         assert result["success"] is True
         assert FLAGGED_CONTENT in skill_md.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# skill_manage: create / edit
+#
+# Both are curator-reachable: the review fork's whitelist is tool-NAME level
+# ("skill_manage", not per-action) and the curator prompt explicitly asks
+# for new umbrella skills, so create/edit is the primary poisoning vector if
+# left unscanned.
+# ---------------------------------------------------------------------------
+
+
+class TestSkillCreateCuratorInjectionScan:
+    def test_create_flagged_dropped_and_denial_recorded(self, skill_root, caplog):
+        set_thread_tool_whitelist({"skill_manage"}, max_denials=5)
+        try:
+            with _background_review(), caplog.at_level(logging.WARNING):
+                result = _create_skill("umbrella-skill", FLAGGED_SKILL_CONTENT)
+
+            assert result["success"] is False
+            # No half-created skill left behind (not even an empty dir).
+            assert not (skill_root / "umbrella-skill").exists()
+
+            import hermes_cli.plugins as plugins_mod
+            assert "skill_manage:create" in plugins_mod._thread_tool_whitelist.denied_tools
+
+            assert any(
+                FLAGGED_PATTERN_ID in rec.message and "skill_manage:create" in rec.message
+                for rec in caplog.records
+                if rec.levelno == logging.WARNING
+            )
+        finally:
+            clear_thread_tool_whitelist()
+
+    def test_create_benign_persists_under_review(self, skill_root):
+        set_thread_tool_whitelist({"skill_manage"}, max_denials=5)
+        try:
+            with _background_review():
+                result = _create_skill("umbrella-skill", VALID_SKILL_CONTENT)
+
+            assert result["success"] is True
+            assert (skill_root / "umbrella-skill" / "SKILL.md").exists()
+
+            import hermes_cli.plugins as plugins_mod
+            assert plugins_mod._thread_tool_whitelist.denied_tools == []
+        finally:
+            clear_thread_tool_whitelist()
+
+    def test_create_same_content_interactive_persists(self, skill_root):
+        """Scope guard: interactively, flagged SKILL.md content persists today
+        (the install-time guard scan is off by default) -- that pre-existing
+        behavior is preserved; only is_background_review() flips the outcome."""
+        result = _create_skill("umbrella-skill", FLAGGED_SKILL_CONTENT)
+
+        assert result["success"] is True
+        assert FLAGGED_CONTENT in (
+            skill_root / "umbrella-skill" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+
+class TestSkillEditCuratorInjectionScan:
+    def test_edit_flagged_dropped_and_denial_recorded(self, skill_root, caplog):
+        skill_md = skill_root / "my-skill" / "SKILL.md"
+        original = skill_md.read_text(encoding="utf-8")
+        set_thread_tool_whitelist({"skill_manage"}, max_denials=5)
+        try:
+            with _background_review(), caplog.at_level(logging.WARNING):
+                mark_background_review_skill_read(skill_md)
+                result = _edit_skill("my-skill", FLAGGED_SKILL_CONTENT)
+
+            assert result["success"] is False
+            assert skill_md.read_text(encoding="utf-8") == original
+
+            import hermes_cli.plugins as plugins_mod
+            assert "skill_manage:edit" in plugins_mod._thread_tool_whitelist.denied_tools
+
+            assert any(
+                FLAGGED_PATTERN_ID in rec.message and "skill_manage:edit" in rec.message
+                for rec in caplog.records
+                if rec.levelno == logging.WARNING
+            )
+        finally:
+            clear_thread_tool_whitelist()
+
+    def test_edit_benign_persists_under_review(self, skill_root):
+        skill_md = skill_root / "my-skill" / "SKILL.md"
+        set_thread_tool_whitelist({"skill_manage"}, max_denials=5)
+        try:
+            with _background_review():
+                mark_background_review_skill_read(skill_md)
+                result = _edit_skill("my-skill", BENIGN_SKILL_CONTENT_2)
+
+            assert result["success"] is True
+            assert "Do the new thing." in skill_md.read_text(encoding="utf-8")
+        finally:
+            clear_thread_tool_whitelist()
+
+    def test_edit_same_content_interactive_persists(self, skill_root):
+        skill_md = skill_root / "my-skill" / "SKILL.md"
+        result = _edit_skill("my-skill", FLAGGED_SKILL_CONTENT)
+
+        assert result["success"] is True
+        assert FLAGGED_CONTENT in skill_md.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# memory: batch
+#
+# Without a curator gate here, batch would drop flagged content (the
+# pre-existing generic scan) but never credit T17's breaker -- unlimited
+# free retries via batch specifically.
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryBatchCuratorInjectionScan:
+    def test_curator_batch_flagged_dropped_and_denial_recorded(self, store, caplog):
+        set_thread_tool_whitelist({"memory"}, max_denials=5)
+        try:
+            with _background_review(), caplog.at_level(logging.WARNING):
+                result = store.apply_batch(
+                    "memory",
+                    [
+                        {"action": "add", "content": BENIGN_CONTENT},
+                        {"action": "add", "content": FLAGGED_CONTENT},
+                    ],
+                )
+
+            assert result["success"] is False
+            # All-or-nothing: the benign op in the same batch is not applied.
+            assert store.memory_entries == []
+
+            import hermes_cli.plugins as plugins_mod
+            assert "memory:batch" in plugins_mod._thread_tool_whitelist.denied_tools
+
+            assert any(
+                FLAGGED_PATTERN_ID in rec.message and "memory:batch" in rec.message
+                for rec in caplog.records
+                if rec.levelno == logging.WARNING
+            )
+        finally:
+            clear_thread_tool_whitelist()
+
+    def test_curator_batch_benign_persists(self, store):
+        set_thread_tool_whitelist({"memory"}, max_denials=5)
+        try:
+            with _background_review():
+                result = store.apply_batch(
+                    "memory", [{"action": "add", "content": BENIGN_CONTENT}]
+                )
+
+            assert result["success"] is True
+            assert BENIGN_CONTENT in store.memory_entries
+
+            import hermes_cli.plugins as plugins_mod
+            assert plugins_mod._thread_tool_whitelist.denied_tools == []
+        finally:
+            clear_thread_tool_whitelist()
+
+    def test_interactive_batch_unchanged_no_denial_recorded(self, store):
+        """Non-review batch: the pre-existing generic scan still rejects the
+        flagged op (with the same per-operation error prefix as before), and
+        the curator gate stays silent -- no denial credited."""
+        set_thread_tool_whitelist({"memory"}, max_denials=5)
+        try:
+            result = store.apply_batch(
+                "memory", [{"action": "add", "content": FLAGGED_CONTENT}]
+            )
+
+            assert result["success"] is False
+            assert result["error"].startswith("Operation 1:")
+
+            import hermes_cli.plugins as plugins_mod
+            assert plugins_mod._thread_tool_whitelist.denied_tools == []
+        finally:
+            clear_thread_tool_whitelist()
