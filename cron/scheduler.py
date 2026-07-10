@@ -47,6 +47,9 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+# Dedicated tag for the per-run stats summary line (finding 14 / T6) so it can
+# be filtered/greppable independent of the rest of cron.scheduler's logging.
+_run_summary_logger = logging.getLogger("cron.run_summary")
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -2924,6 +2927,23 @@ def run_job(
 
     agent = None
 
+    # Per-run stats (finding 14 / T6): captured here regardless of outcome
+    # and attached to `agent` in the `finally` block below, rather than
+    # added as a 5th return value or an out-param. run_job's 4-tuple return
+    # is unpacked by ~40 call sites across tests (and several tests replace
+    # run_job wholesale with a fixed-arity fake), so widening the return
+    # shape or the call signature would ripple out well past this slice.
+    # `defer_agent_teardown` already threads the live agent back to
+    # run_one_job for exactly this kind of post-return inspection (#58720),
+    # so stashing the stats dict on that same object costs nothing extra.
+    # started_at prefers the recurring job's durable running_marker
+    # timestamp (stamped at fire time, before this function was even
+    # called) when present; one-shot jobs carry no running_marker, so fall
+    # back to this function's own clock.
+    _stats_start_monotonic = time.monotonic()
+    _stats_started_at = (job.get("running_marker") or {}).get("at") or _hermes_now().isoformat()
+    _stats_exit_reason = "error"
+
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
     # scheduler process — every job this process runs is a cron job.
@@ -3556,12 +3576,33 @@ def run_job(
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+        _stats_exit_reason = "completed"
         return True, output, final_response, None
-        
+
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        
+
+        # Bucket the exit reason from what's visible here: the two explicit
+        # TimeoutError raises above carry distinguishing text ("idle for" /
+        # "wall-clock") so inactivity and the wall-clock runtime cap are
+        # told apart cheaply; anything else mentioning "interrupt" covers
+        # agent.interrupt()-driven aborts that surface as a plain
+        # RuntimeError (e.g. turn_exit_reason="interrupted_during_api_call"
+        # re-raised above) or the gateway-shutdown interrupt path; every
+        # other exception is a generic run failure.
+        if isinstance(e, TimeoutError):
+            if "idle for" in str(e):
+                _stats_exit_reason = "timeout_inactivity"
+            elif "wall-clock" in str(e):
+                _stats_exit_reason = "timeout_wall_clock"
+            else:
+                _stats_exit_reason = "timeout"
+        elif "interrupt" in str(e).lower():
+            _stats_exit_reason = "interrupted"
+        else:
+            _stats_exit_reason = "error"
+
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
@@ -3620,6 +3661,30 @@ def run_job(
                 _session_db.close()
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+        # Stash the per-run stats collected above on the agent object itself
+        # (see the comment by `_stats_start_monotonic`) so a caller that
+        # receives the agent back via `defer_agent_teardown` — currently only
+        # run_one_job — can read them after this function returns. No-op
+        # when `agent` never got constructed (e.g. a credential/config error
+        # before AIAgent(...) was built): nothing measurable happened.
+        if agent is not None:
+            _stats_activity = {}
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    _stats_activity = agent.get_activity_summary() or {}
+                except Exception:
+                    _stats_activity = {}
+            if not isinstance(_stats_activity, dict):
+                _stats_activity = {}
+            agent._cron_run_stats = {
+                "started_at": _stats_started_at,
+                "ended_at": _hermes_now().isoformat(),
+                "duration_s": round(time.monotonic() - _stats_start_monotonic, 3),
+                "api_calls": _stats_activity.get("api_call_count", 0),
+                "output_tokens": getattr(agent, "session_output_tokens", 0) or 0,
+                "exit_reason": _stats_exit_reason,
+            }
+
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -3730,6 +3795,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         finally:
             reset_secret_scope(_scope_token)
 
+        # Per-run stats (finding 14 / T6): run_job attaches them to the agent
+        # object rather than widening its 4-tuple return (see the comment in
+        # run_job by `_stats_start_monotonic`), so read them off the same
+        # `_deferred_agents` list used for teardown deferral. `None` when no
+        # agent was constructed (no_agent script jobs, or an error before
+        # AIAgent(...) was built) — nothing measurable to report for those.
+        run_stats = getattr(_deferred_agents[0], "_cron_run_stats", None) if _deferred_agents else None
+
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
         # between run_job returning and delivery — save_job_output, the [SILENT]
@@ -3794,8 +3867,38 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        # One structured summary line per run — independent of delivery
+        # outcome (delivery errors above are already caught and recorded in
+        # `delivery_error`, never raised) and independent of whether the job
+        # record survives to receive `last_run_stats` below (a one-shot that
+        # exhausts its repeat limit gets popped inside mark_job_run — see its
+        # docstring). This is the only place "did last night's job run, how
+        # long, what did it cost, why did it stop" is guaranteed answerable.
+        _stats_for_log = run_stats or {}
+        _run_summary_logger.info(
+            "job_id=%s name=%s success=%s started_at=%s ended_at=%s "
+            "duration_s=%s api_calls=%s output_tokens=%s exit_reason=%s",
+            job["id"],
+            job.get("name") or job["id"],
+            success,
+            _stats_for_log.get("started_at"),
+            _stats_for_log.get("ended_at"),
+            _stats_for_log.get("duration_s"),
+            _stats_for_log.get("api_calls"),
+            _stats_for_log.get("output_tokens"),
+            _stats_for_log.get("exit_reason"),
+        )
+
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            # Only pass `stats` when there's something to pass — omitting it
+            # entirely is behaviorally identical to `stats=None` (mark_job_run
+            # writes no `last_run_stats` key either way), and this keeps the
+            # call shape unchanged for existing `mark_job_run` test doubles /
+            # `assert_called_once_with` expectations when no agent stats were
+            # collected (no_agent jobs, or a run_job test double that doesn't
+            # participate in the defer_agent_teardown protocol).
+            _mark_kwargs = {"stats": run_stats} if run_stats is not None else {}
+            mark_job_run(job["id"], success, error, delivery_error=delivery_error, **_mark_kwargs)
         return True
 
     except Exception as e:

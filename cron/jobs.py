@@ -1588,15 +1588,27 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 stats: Optional[dict] = None):
     """
     Mark a job as having been run.
-    
+
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``stats``: optional per-run stats dict (finding 14 / T6) —
+    ``{"started_at", "ended_at", "duration_s", "api_calls", "output_tokens",
+    "exit_reason"}`` — persisted verbatim as ``job["last_run_stats"]``.
+    ``None`` (the default) writes no ``last_run_stats`` key at all, so
+    existing callers that don't pass it are unaffected. Caveat: a one-shot
+    job that hits its repeat limit on this run is popped from the jobs list
+    a few lines below (before the final ``save_jobs``) — stats computed for
+    that terminal run are accepted but never persisted, since the record
+    they'd attach to is deleted in the same call. Accepted trade-off, not a
+    bug: there is nothing left to read them from afterwards.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1622,6 +1634,12 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # carried a marker (one-shots never do).
                 if job.get("running_marker") is not None:
                     job["running_marker"] = None
+
+                # Record per-run stats (started/ended/duration/api-calls/
+                # output-tokens/exit-reason) when the caller collected them.
+                # Omitted entirely for legacy callers that don't pass stats.
+                if stats is not None:
+                    job["last_run_stats"] = stats
 
                 # Increment completed count.  Finite one-shot jobs are
                 # pre-claimed by claim_dispatch() BEFORE the side effect runs
