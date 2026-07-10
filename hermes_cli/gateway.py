@@ -236,11 +236,11 @@ def _is_pid_ancestor_of_current_process(target_pid: int) -> bool:
     return False
 
 
-# Cap the ancestry walk used by the restart/stop self-targeting guard. The
-# guard only needs to spot "we're a few hops below the gateway process"
-# (gateway -> agent loop -> terminal tool -> shell -> hermes CLI), not walk
-# all the way to PID 1 — keeping this bounded matters because the ``ps``
-# fallback in ``_get_parent_pid`` shells out once per hop.
+# Cap the ancestry walk used by the restart self-targeting guard. The guard
+# only needs to spot "we're a few hops below the gateway process" (gateway ->
+# agent loop -> terminal tool -> shell -> hermes CLI), not walk all the way
+# to PID 1 — keeping this bounded matters because the ``ps`` fallback in
+# ``_get_parent_pid`` shells out once per hop.
 _RESTART_GUARD_MAX_ANCESTRY_DEPTH = 10
 
 
@@ -266,8 +266,8 @@ def _ancestor_pids(max_depth: int = _RESTART_GUARD_MAX_ANCESTRY_DEPTH) -> list[i
 
 def _invoked_from_within_gateway() -> bool:
     """Detect whether this CLI invocation is running inside the gateway's own
-    process tree — the condition the ``gateway stop``/``restart``
-    self-targeting guard refuses on.
+    process tree — the condition the ``gateway restart`` self-targeting
+    guard refuses on.
 
     Primary signal: the ``_HERMES_GATEWAY=1`` env var the gateway sets on
     itself and its children. A child context that strips env vars before
