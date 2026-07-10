@@ -335,6 +335,12 @@ _MAX_BACKOFF_SECONDS = 60
 # can ever reach the circuit-breaker half-open probe or _signal_reconnect.
 _PARKED_RETRY_INTERVAL = 300     # seconds between parked self-probes
 _RECYCLED_RECONNECT_TIMEOUT = 15.0
+# During a sustained outage, repeated keepalive-triggered reconnect cycles
+# roll their WARNING logs up into DEBUG (see MCPServerTask._record_keepalive_
+# failure) so a server that's down for hours doesn't write hundreds of
+# identical lines. This is the ceiling on how long that silence can run
+# before a WARNING-level heartbeat surfaces the outage again.
+_ROLLUP_HEARTBEAT_INTERVAL = 1800  # seconds (30 min) between rollup warnings
 
 # Keepalive cadence for HTTP/SSE sessions. The MCP spec lets a server expire
 # idle sessions on any TTL it chooses (Streamable HTTP "Session Management"),
@@ -1527,6 +1533,9 @@ class MCPServerTask:
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
         "_reconnect_retries",
+        "_last_reconnect_cycle_at", "_reconnect_is_external",
+        "_outage_started_at", "_outage_started_wall",
+        "_reconnect_failure_count", "_last_rollup_emitted_at",
     )
 
     def __init__(self, name: str):
@@ -1587,6 +1596,25 @@ class MCPServerTask:
         # back to ``list_tools`` (the pre-ping probe) so we neither spam pings
         # nor reconnect-loop. Reset on each fresh transport connection.
         self._ping_unsupported: bool = False
+        # Dwell + failure-log rollup state for keepalive-triggered reconnects.
+        # A sustained outage repeatedly drives the server through
+        # session-established -> immediate-keepalive-failure without ever
+        # raising an exception out of _run_http/_run_stdio, so the
+        # exception-branch retry/backoff/park machinery in run() never
+        # engages -- this dwell fills that gap. Monotonic; unaffected by
+        # wall-clock adjustments.
+        self._last_reconnect_cycle_at: Optional[float] = None
+        # True when the pending/most-recent _reconnect_event.set() came from
+        # an explicit external caller (_signal_reconnect /
+        # _signal_reconnect_and_wait -- OAuth recovery, session-expired
+        # retry, the tool handler's dead-session nudge, a future manual
+        # ``/mcp`` refresh) rather than the internal keepalive probe.
+        # External requests bypass the dwell below.
+        self._reconnect_is_external: bool = False
+        self._outage_started_at: Optional[float] = None
+        self._outage_started_wall: Optional[str] = None
+        self._reconnect_failure_count: int = 0
+        self._last_rollup_emitted_at: Optional[float] = None
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -1861,6 +1889,62 @@ class MCPServerTask:
         # Fallback probe for servers without ping support.
         await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
 
+    def _record_keepalive_failure(self, exc: Exception) -> None:
+        """Log a keepalive failure, rolling up repeats within one outage.
+
+        The first failure in a new outage logs at WARNING (unchanged
+        behavior). Subsequent failures while the same outage continues log
+        at DEBUG and increment ``_reconnect_failure_count`` instead, so a
+        server that's down for hours doesn't write hundreds of identical
+        WARNING lines. A WARNING rollup line is emitted every
+        :data:`_ROLLUP_HEARTBEAT_INTERVAL` seconds so a long outage still
+        surfaces at WARNING level periodically, and again (with the final
+        count) on recovery -- see :meth:`_record_keepalive_recovery`.
+        """
+        now = time.monotonic()
+        if self._outage_started_at is None:
+            self._outage_started_at = now
+            self._outage_started_wall = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._reconnect_failure_count = 1
+            self._last_rollup_emitted_at = now
+            logger.warning(
+                "MCP server '%s' keepalive failed, "
+                "triggering reconnect: %s",
+                self.name, exc,
+            )
+            return
+
+        self._reconnect_failure_count += 1
+        logger.debug(
+            "MCP server '%s' keepalive failed, triggering reconnect: %s",
+            self.name, exc,
+        )
+        last_rollup = self._last_rollup_emitted_at or self._outage_started_at
+        if now - last_rollup >= _ROLLUP_HEARTBEAT_INTERVAL:
+            self._emit_rollup_warning(now)
+
+    def _emit_rollup_warning(self, now: float) -> None:
+        """Emit a single WARNING summarizing the outage so far."""
+        logger.warning(
+            "MCP server '%s' unreachable: %d failed cycles since %s",
+            self.name, self._reconnect_failure_count, self._outage_started_wall,
+        )
+        self._last_rollup_emitted_at = now
+
+    def _record_keepalive_recovery(self) -> None:
+        """Clear outage/rollup state and report recovery once, if we were down."""
+        if self._outage_started_at is not None:
+            self._emit_rollup_warning(time.monotonic())
+            logger.warning(
+                "MCP server '%s' keepalive recovered after %d failed cycle(s)",
+                self.name, self._reconnect_failure_count,
+            )
+            self._outage_started_at = None
+            self._outage_started_wall = None
+            self._reconnect_failure_count = 0
+            self._last_rollup_emitted_at = None
+        self._last_reconnect_cycle_at = None
+
     async def _wait_for_lifecycle_event(self) -> str:
         """Block until either _shutdown_event or _reconnect_event fires.
 
@@ -1940,13 +2024,11 @@ class MCPServerTask:
                     try:
                         await self._keepalive_probe()
                     except Exception as exc:
-                        logger.warning(
-                            "MCP server '%s' keepalive failed, "
-                            "triggering reconnect: %s",
-                            self.name, exc,
-                        )
+                        self._record_keepalive_failure(exc)
                         self._reconnect_event.set()
                         break
+                    else:
+                        self._record_keepalive_recovery()
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
@@ -1966,15 +2048,22 @@ class MCPServerTask:
     ) -> str:
         """Block until a reconnect or shutdown is requested while parked.
 
-        Used by :meth:`run` after the reconnect budget is exhausted. The
-        task stays alive (so ``_reconnect_event`` always has a listener) but
-        does no work until something explicitly asks it to come back —
-        OAuth recovery, a manual ``/mcp`` refresh — or, when ``timeout`` is
-        given, until the timeout elapses (a periodic self-probe). The timed
-        wake matters because parking deregisters this server's tools, so
-        no tool call can ever reach the circuit-breaker's half-open probe
-        or ``_signal_reconnect`` — without a self-probe a parked server
-        would be unrevivable short of a full reload.
+        Used by :meth:`run` in two places:
+
+        * After the reconnect budget is exhausted (parked). The task stays
+          alive (so ``_reconnect_event`` always has a listener) but does no
+          work until something explicitly asks it to come back — OAuth
+          recovery, a manual ``/mcp`` refresh — or, when ``timeout`` is
+          given, until the timeout elapses (a periodic self-probe). The
+          timed wake matters because parking deregisters this server's
+          tools, so no tool call can ever reach the circuit-breaker's
+          half-open probe or ``_signal_reconnect`` — without a self-probe a
+          parked server would be unrevivable short of a full reload.
+        * As the dwell between keepalive-triggered reconnect cycles (see the
+          "reconnect" handling in :meth:`run`), so a server that keeps
+          coming back up just long enough to fail its next keepalive probe
+          doesn't reconnect-loop with no pause. An explicit external request
+          still wakes it immediately.
 
         Returns:
             ``"shutdown"`` if the server should exit the run loop entirely,
@@ -2694,9 +2783,10 @@ class MCPServerTask:
                     lifecycle_reason = await self._run_stdio(config)
                 # Transport returned cleanly. Two cases:
                 #  - _shutdown_event was set: exit the run loop entirely.
-                #  - _reconnect_event was set (auth recovery): loop back and
-                #    rebuild the MCP session with fresh credentials. Do NOT
-                #    touch the retry counters — this is not a failure.
+                #  - _reconnect_event was set (auth recovery, manual refresh,
+                #    or an internal keepalive failure): loop back and rebuild
+                #    the MCP session. Do NOT touch the retry counters — this
+                #    is not a transport-level failure.
                 if self._shutdown_event.is_set():
                     break
                 if lifecycle_reason == "recycle":
@@ -2711,18 +2801,53 @@ class MCPServerTask:
                         break
                     self._reconnect_event.clear()
                     continue
+
+                # Distinguish an explicit external request (OAuth recovery,
+                # manual /mcp refresh, the tool handler's dead-session nudge
+                # -- see _signal_reconnect / _signal_reconnect_and_wait) from
+                # an internal keepalive failure. External requests are
+                # deliberate, one-shot asks and always bypass the dwell
+                # below; only the internal keepalive path needs it, because
+                # a server that keeps coming back up just long enough to
+                # fail its next keepalive probe never raises an exception
+                # out of _run_http/_run_stdio, so it never reaches the
+                # exception-branch backoff/park logic further down.
+                external_request = self._reconnect_is_external
+                self._reconnect_is_external = False
+                if not external_request:
+                    now = time.monotonic()
+                    if self._last_reconnect_cycle_at is not None:
+                        remaining = _PARKED_RETRY_INTERVAL - (
+                            now - self._last_reconnect_cycle_at
+                        )
+                        if remaining > 0:
+                            waited = await self._wait_for_reconnect_or_shutdown(
+                                timeout=remaining
+                            )
+                            if waited == "shutdown":
+                                return
+                            if self._reconnect_is_external:
+                                # An explicit request arrived mid-dwell —
+                                # honor it now rather than finish the wait.
+                                external_request = True
+                                self._reconnect_is_external = False
+                            now = time.monotonic()
+                    self._last_reconnect_cycle_at = now
+
                 logger.info(
-                    "MCP server '%s': reconnecting (OAuth recovery or "
-                    "manual refresh)",
+                    "MCP server '%s': reconnecting (%s)",
                     self.name,
+                    "OAuth recovery or manual refresh" if external_request
+                    else "keepalive failure",
                 )
                 # A clean transport return only happens after a session was
                 # successfully established and then asked to rebuild (auth
-                # recovery / manual refresh / breaker-driven reconnect). That
-                # is proof the server is reachable, so clear the consecutive-
-                # failure budget — otherwise transient drops accumulated over
-                # a long-lived session would eventually exhaust it and
-                # permanently kill an otherwise-healthy server.
+                # recovery / manual refresh / breaker-driven reconnect /
+                # keepalive failure). That is proof the server was reachable
+                # a moment ago, so clear the consecutive-failure budget —
+                # otherwise transient drops accumulated over a long-lived
+                # session would eventually exhaust it and permanently kill
+                # an otherwise-healthy server.
                 self._reconnect_retries = 0
                 backoff = 1.0
                 # Reset the session reference and readiness; _run_http/_run_stdio
@@ -3031,11 +3156,23 @@ def _signal_reconnect(server: Any) -> bool:
     event = getattr(server, "_reconnect_event", None)
     if event is None:
         return False
+
+    def _mark_and_set() -> None:
+        # Tag this as an explicit external request so run()'s dwell (which
+        # only throttles internal keepalive-triggered reconnects) is
+        # bypassed for it. Best-effort: stub servers in tests may not carry
+        # the attribute.
+        try:
+            server._reconnect_is_external = True
+        except AttributeError:
+            pass
+        event.set()
+
     loop = _mcp_loop
     if loop is not None and loop.is_running():
-        loop.call_soon_threadsafe(event.set)
+        loop.call_soon_threadsafe(_mark_and_set)
     else:
-        event.set()
+        _mark_and_set()
     return True
 
 
@@ -3109,6 +3246,12 @@ def _signal_reconnect_and_wait(
             ready.clear()
         reconnect_event = getattr(srv, "_reconnect_event", None)
         if reconnect_event is not None and hasattr(reconnect_event, "set"):
+            # Explicit external request (OAuth recovery, session-expired
+            # retry) — bypasses run()'s keepalive-failure dwell.
+            try:
+                srv._reconnect_is_external = True
+            except AttributeError:
+                pass
             reconnect_event.set()
 
     logger.info(
