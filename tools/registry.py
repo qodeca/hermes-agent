@@ -139,6 +139,13 @@ _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
 _check_fn_cache: Dict[Callable, tuple[float, bool]] = {}
 # Monotonic timestamp of the most recent True result per check_fn.
 _check_fn_last_good: Dict[Callable, float] = {}
+# Last availability state we actually LOGGED for each check_fn (True/False),
+# separate from _check_fn_cache's TTL-bound value. Used to log only on
+# True<->False transitions instead of once per TTL expiry (issue: 9 identical
+# honored-failure WARNINGs per turn on idle/gateway sessions where turns are
+# spaced further apart than _CHECK_FN_TTL_SECONDS, so every turn re-probed and
+# re-warned). Absent key == never logged yet.
+_check_fn_last_logged_state: Dict[Callable, bool] = {}
 _check_fn_cache_lock = threading.Lock()
 
 
@@ -170,13 +177,28 @@ def _check_fn_cached(fn: Callable) -> bool:
         if value:
             _check_fn_last_good[fn] = now
             _check_fn_cache[fn] = (now, True)
+            if _check_fn_last_logged_state.get(fn) is False:
+                # Recovered from a previously-logged failure — worth a line
+                # even though it's good news, so operators see the flip.
+                logger.info(
+                    "check_fn %s available again",
+                    getattr(fn, "__qualname__", fn),
+                )
+            else:
+                logger.debug(
+                    "check_fn %s available",
+                    getattr(fn, "__qualname__", fn),
+                )
+            _check_fn_last_logged_state[fn] = True
             return True
 
         last_good = _check_fn_last_good.get(fn)
         if last_good is not None and now - last_good < _CHECK_FN_FAILURE_GRACE_SECONDS:
             # Recent success → treat this failure as a flake. Serve last-good
             # True and do NOT cache the failure, so the next call re-probes
-            # rather than pinning a stale verdict for the full TTL.
+            # rather than pinning a stale verdict for the full TTL. Grace
+            # warnings are intentionally unconditional (not transition-gated):
+            # each flake is a distinct, actionable event.
             logger.warning(
                 "check_fn %s failed (%s) within %.0fs of last success; "
                 "treating as transient and keeping tool(s) available",
@@ -186,23 +208,40 @@ def _check_fn_cached(fn: Callable) -> bool:
             )
             return True
 
-        # No recent success (or grace expired) — honor the failure. Log it so
-        # silent tool loss in quiet mode (subagents) is diagnosable.
-        logger.warning(
-            "check_fn %s %s; dependent tools will be unavailable this turn",
-            getattr(fn, "__qualname__", fn),
-            "raised" if raised else "returned False",
-        )
+        # No recent success (or grace expired) — honor the failure. Log at
+        # WARNING only on the True/unknown -> False transition so silent tool
+        # loss in quiet mode (subagents) is still diagnosable without
+        # repeating the same WARNING on every turn while the outage persists.
+        if _check_fn_last_logged_state.get(fn) is not False:
+            logger.warning(
+                "check_fn %s %s; dependent tools will be unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+                "raised" if raised else "returned False",
+            )
+        else:
+            logger.debug(
+                "check_fn %s still %s; dependent tools remain unavailable",
+                getattr(fn, "__qualname__", fn),
+                "raising" if raised else "returning False",
+            )
+        _check_fn_last_logged_state[fn] = False
         _check_fn_cache[fn] = (now, False)
         return False
 
 
 def invalidate_check_fn_cache() -> None:
     """Drop all cached ``check_fn`` results. Call after config changes that
-    affect tool availability (e.g. ``hermes tools enable``)."""
+    affect tool availability (e.g. ``hermes tools enable``).
+
+    Also resets the last-logged-state used for transition-only logging, so a
+    manual invalidation always produces one fresh WARNING/INFO/DEBUG line on
+    the next probe instead of being suppressed as a steady-state repeat of
+    whatever was logged before the invalidation.
+    """
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+        _check_fn_last_logged_state.clear()
 
 
 class ToolRegistry:
