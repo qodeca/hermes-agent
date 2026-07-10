@@ -1826,6 +1826,88 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
     return None
 
 
+def _resolve_open_allow_all_platforms(config, *, global_allow_all: bool) -> list:
+    """Return the sorted platform values with an active allow-all at startup.
+
+    Two independent sources feed this:
+
+    * Per-platform ``<PLATFORM>_ALLOW_ALL_USERS`` env vars — each opens only
+      that one platform. Sourced from ``authz_mixin.PLATFORM_ALLOW_ALL_ENV``,
+      the SAME mapping ``_is_user_authorized`` consults, plus any plugin
+      platform that registered its own ``allow_all_env``, so this list can
+      never drift from what actually grants access.
+    * The deprecated global ``GATEWAY_ALLOW_ALL_USERS`` — it opens every
+      platform configured on this gateway at once, so when set every
+      platform in ``config.platforms`` is reported "open" regardless of its
+      individual flag (matching ``_is_user_authorized``'s fallback order:
+      global allow-all is the last opt-in before default-deny).
+    """
+    from gateway.authz_mixin import PLATFORM_ALLOW_ALL_ENV
+
+    open_platforms = {
+        platform.value
+        for platform, env_var in PLATFORM_ALLOW_ALL_ENV.items()
+        if os.getenv(env_var, "").lower() in {"true", "1", "yes"}
+    }
+    try:
+        from gateway.platform_registry import platform_registry
+        open_platforms.update(
+            entry.name
+            for entry in platform_registry.plugin_entries()
+            if entry.allow_all_env
+            and os.getenv(entry.allow_all_env, "").lower() in {"true", "1", "yes"}
+        )
+    except Exception:
+        pass
+
+    if global_allow_all:
+        open_platforms.update(
+            platform.value for platform in getattr(config, "platforms", {})
+        )
+
+    return sorted(open_platforms)
+
+
+def _send_allow_all_startup_alert(open_platforms: list, *, global_allow_all: bool) -> None:
+    """Fire one operator alert when allow-all authorization is active at startup.
+
+    Guarded import (hermes_cli.operator_alerts): the alert helper is
+    optional infrastructure, and a failure anywhere in alert delivery must
+    never block gateway startup. ``send_operator_alert`` itself already
+    never raises (see its docstring), but the import and call are still
+    wrapped defensively so a change to that contract can never regress
+    this guarantee.
+    """
+    try:
+        from hermes_cli.operator_alerts import send_operator_alert
+    except Exception:
+        logger.debug(
+            "startup allow-all alert skipped: hermes_cli.operator_alerts unavailable",
+            exc_info=True,
+        )
+        return
+
+    platforms_desc = ", ".join(open_platforms)
+    title = "Gateway allow-all active at startup"
+    body = (
+        f"Open platform(s): {platforms_desc}. Anyone who can message "
+        f"{'these platforms' if len(open_platforms) > 1 else 'this platform'} "
+        "can reach the agent."
+    )
+    if global_allow_all:
+        body += (
+            " GATEWAY_ALLOW_ALL_USERS is deprecated -- switch to the "
+            "per-platform <PLATFORM>_ALLOW_ALL_USERS flag to scope open "
+            "access to only the platform(s) that need it."
+        )
+    try:
+        send_operator_alert(title, body, severity="warning")
+    except Exception:
+        logger.debug(
+            "startup allow-all alert delivery raised unexpectedly", exc_info=True,
+        )
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -6854,7 +6936,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _any_allowlist = any(
             os.getenv(v) for v in _builtin_allowed_vars + _plugin_allowed_vars
         )
-        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"} or any(
+        _global_allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        _allow_all = _global_allow_all or any(
             os.getenv(v, "").lower() in {"true", "1", "yes"}
             for v in _builtin_allow_all_vars + _plugin_allow_all_vars
         )
@@ -6866,6 +6949,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "or explicitly opt in with GATEWAY_ALLOW_ALL_USERS=true plus "
                 "dm_policy/group_policy: open on the platform."
             )
+
+        # Deprecated global allow-all + loud startup alerting:
+        # GATEWAY_ALLOW_ALL_USERS collapses authorization for every platform
+        # at once. It keeps working for backward compatibility, but every
+        # startup where ANY allow-all (global or per-platform) is active
+        # gets a deprecation warning (global only) and exactly one operator
+        # alert naming the open platform(s) -- so "wide open" is never
+        # silent, whether that was intentional or a stale .env value.
+        if _allow_all:
+            if _global_allow_all:
+                logger.warning(
+                    "GATEWAY_ALLOW_ALL_USERS is deprecated: it opens EVERY "
+                    "configured messaging platform at once. Prefer the "
+                    "per-platform <PLATFORM>_ALLOW_ALL_USERS flag (e.g. "
+                    "TELEGRAM_ALLOW_ALL_USERS=true) to scope open access to "
+                    "a single platform."
+                )
+            _open_allow_all_platforms = _resolve_open_allow_all_platforms(
+                self.config, global_allow_all=_global_allow_all,
+            )
+            if _open_allow_all_platforms:
+                _send_allow_all_startup_alert(
+                    _open_allow_all_platforms, global_allow_all=_global_allow_all,
+                )
 
         reason = _own_policy_open_startup_violation(self.config)
         if reason:

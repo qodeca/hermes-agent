@@ -27,6 +27,34 @@ from gateway.whatsapp_identity import (
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
 )
 
+# Per-platform "allow all users" opt-in env vars, keyed by Platform. This is
+# the single source of truth for which env var opens which built-in
+# platform's authorization gate below (``_is_user_authorized``); ``gateway/
+# run.py``'s startup diagnostics (deprecation warning for the global flag +
+# operator alert listing open platforms) import this SAME mapping rather
+# than keeping a second, driftable copy of the platform->env-var
+# association.
+PLATFORM_ALLOW_ALL_ENV: dict[Platform, str] = {
+    Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
+    Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
+    Platform.WHATSAPP: "WHATSAPP_ALLOW_ALL_USERS",
+    Platform.WHATSAPP_CLOUD: "WHATSAPP_CLOUD_ALLOW_ALL_USERS",
+    Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
+    Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
+    Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
+    Platform.SMS: "SMS_ALLOW_ALL_USERS",
+    Platform.MATTERMOST: "MATTERMOST_ALLOW_ALL_USERS",
+    Platform.MATRIX: "MATRIX_ALLOW_ALL_USERS",
+    Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
+    Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
+    Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
+    Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOW_ALL_USERS",
+    Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
+    Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
+    Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
+    Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+}
+
 
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
@@ -389,26 +417,10 @@ class GatewayAuthorizationMixin:
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
         }
-        platform_allow_all_map = {
-            Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
-            Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
-            Platform.WHATSAPP: "WHATSAPP_ALLOW_ALL_USERS",
-            Platform.WHATSAPP_CLOUD: "WHATSAPP_CLOUD_ALLOW_ALL_USERS",
-            Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
-            Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
-            Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
-            Platform.SMS: "SMS_ALLOW_ALL_USERS",
-            Platform.MATTERMOST: "MATTERMOST_ALLOW_ALL_USERS",
-            Platform.MATRIX: "MATRIX_ALLOW_ALL_USERS",
-            Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
-            Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
-            Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
-            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOW_ALL_USERS",
-            Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
-            Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
-            Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
-            Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
-        }
+        # Copy (not alias): the plugin-registry loop right below mutates this
+        # per-call with dynamically registered plugin platforms, and the
+        # shared module-level PLATFORM_ALLOW_ALL_ENV must stay immutable.
+        platform_allow_all_map = dict(PLATFORM_ALLOW_ALL_ENV)
 
         # Plugin platforms: check the registry for auth env var names
         if source.platform not in platform_env_map:
