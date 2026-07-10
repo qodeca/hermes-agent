@@ -484,6 +484,50 @@ def parse_duration(s: str) -> int:
     return value * multipliers[unit]
 
 
+# A fully date-pinned cron expression (day-of-month AND month are both pure
+# digits, e.g. "0 2 10 7 *") is syntactically identical to a legitimate
+# yearly job ("0 9 1 1 *" = every Jan 1). Only the 5-field form is checked —
+# a 6th field is croniter seconds (minute hour day month weekday second, per
+# https://github.com/kiorky/croniter), not a year, and near-term detection
+# does not extend to it.
+_CRON_DIGIT_FIELD_RE = re.compile(r'^\d+$')
+
+# A date-pinned cron expression whose next occurrence lands within this many
+# days is treated as a one-shot trap (e.g. the model emitted a yearly cron
+# for "tonight at 02:00"), not an intentional yearly schedule.
+NEAR_TERM_ONE_SHOT_WINDOW_DAYS = 31
+
+
+def is_date_pinned_cron_expr(expr: str) -> bool:
+    """Return True when a 5-field cron expression pins both day-of-month and
+    month to a single digit value (no ``*``, ``-``, ``,``, ``/``).
+
+    This is the same syntax used by legitimate yearly jobs, so this check is
+    purely structural — callers decide whether the *proximity* of the next
+    occurrence makes it a near-term one-shot trap or a real yearly job.
+    """
+    parts = expr.split()
+    if len(parts) != 5:
+        return False
+    day_of_month, month = parts[2], parts[3]
+    return bool(_CRON_DIGIT_FIELD_RE.match(day_of_month) and _CRON_DIGIT_FIELD_RE.match(month))
+
+
+def is_date_pinned_yearly_schedule(schedule: Any) -> bool:
+    """Return True when a stored/parsed schedule dict is a recurring cron job
+    pinned to a single calendar date (i.e. yearly cadence).
+
+    Shared by ``parse_schedule`` (to decide what stays ``kind="cron"``) and by
+    ``tools/cronjob_tools.py`` (to surface a create-time notice steering the
+    user toward an ISO one-shot when that's what they likely meant). Living
+    here — not duplicated in the tool — lets other callers of ``create_job``
+    (e.g. the CLI's ``hermes cron add``) reuse the same detection later.
+    """
+    if not isinstance(schedule, dict) or schedule.get("kind") != "cron":
+        return False
+    return is_date_pinned_cron_expr(schedule.get("expr") or "")
+
+
 def parse_schedule(schedule: str) -> Dict[str, Any]:
     """
     Parse schedule string into structured format.
@@ -529,6 +573,32 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             croniter(schedule)
         except Exception as e:
             raise ValueError(f"Invalid cron expression '{schedule}': {e}")
+
+        # Near-term date-pinned trap (incident root cause): a model asked for
+        # "tonight at 02:00" can emit "0 2 10 7 *" — valid cron, but it fires
+        # once tonight then silently reschedules a year out. A date-pinned
+        # 5-field expression (day-of-month AND month both pure digits) is
+        # ALSO the legitimate syntax for an intentional yearly job
+        # ("0 9 1 1 *" = every Jan 1), so proximity is the only signal that
+        # distinguishes the two: only convert when the next occurrence is
+        # within NEAR_TERM_ONE_SHOT_WINDOW_DAYS. A date-pinned expression
+        # whose next occurrence is further out stays a recurring "cron"
+        # schedule (the create tool surfaces a notice for that case — see
+        # is_date_pinned_yearly_schedule).
+        if len(parts) == 5 and is_date_pinned_cron_expr(schedule):
+            now = _hermes_now()
+            # Anchor the same way compute_next_run anchors a fresh schedule
+            # (no last_run_at yet): base = _hermes_now(), which carries the
+            # configured Hermes tz, not server-local or UTC.
+            next_dt = croniter(schedule, now).get_next(datetime)
+            if next_dt - now <= timedelta(days=NEAR_TERM_ONE_SHOT_WINDOW_DAYS):
+                run_at = next_dt.isoformat()
+                return {
+                    "kind": "once",
+                    "run_at": run_at,
+                    "display": f"{schedule} → one-shot {run_at}",
+                }
+
         return {
             "kind": "cron",
             "expr": schedule,

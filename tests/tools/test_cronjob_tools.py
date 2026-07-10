@@ -309,6 +309,49 @@ class TestUnifiedCronjobTool:
         assert updated["job"]["name"] == "New Name"
         assert updated["job"]["schedule"] == "every 120m"
 
+    def test_create_near_term_date_pinned_cron_becomes_one_shot(self, monkeypatch):
+        """Incident regression: a model-emitted date-pinned cron for a
+        near-term date (the '0 2 10 7 *' trap for "tonight at 02:00") must
+        be stored as a one-shot, not a yearly recurring job."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime(2026, 7, 9, 10, 0, 0, tzinfo=timezone(timedelta(hours=1)))
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        created = json.loads(
+            cronjob(action="create", prompt="Check", schedule="0 2 10 7 *")
+        )
+
+        assert created["success"] is True
+        assert "one-shot" in created["schedule"]
+        assert "yearly" not in created["message"]
+
+    def test_create_far_out_date_pinned_cron_surfaces_yearly_notice(self, monkeypatch):
+        """A date-pinned cron whose next occurrence is far away stays
+        recurring, but create surfaces a notice steering the user to an ISO
+        timestamp if a one-time run was actually intended."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone(timedelta(hours=1)))
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        created = json.loads(
+            cronjob(action="create", prompt="Check", schedule="0 9 1 1 *")
+        )
+
+        assert created["success"] is True
+        assert created["schedule"] == "0 9 1 1 *"
+        assert "yearly schedule" in created["message"]
+        assert "ISO timestamp" in created["message"]
+
+    def test_create_non_date_pinned_cron_has_no_yearly_notice(self):
+        created = json.loads(
+            cronjob(action="create", prompt="Check", schedule="0 9 * * *")
+        )
+
+        assert created["success"] is True
+        assert "yearly" not in created["message"]
+
     def test_update_runtime_overrides_can_set_and_clear(self):
         created = json.loads(
             cronjob(

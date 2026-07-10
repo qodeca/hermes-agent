@@ -24,6 +24,7 @@ from cron.jobs import (
     claim_job_for_fire,
     create_job,
     get_job,
+    is_date_pinned_yearly_schedule,
     list_jobs,
     mark_job_run,
     parse_schedule,
@@ -756,6 +757,11 @@ def cronjob(
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
+            if is_date_pinned_yearly_schedule(job.get("schedule")):
+                _create_message = (
+                    f"{_create_message} Note: this is a yearly schedule; "
+                    "for a one-time run use an ISO timestamp."
+                )
             return json.dumps(
                 {
                     "success": True,
@@ -1003,7 +1009,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "schedule": {
                 "type": "string",
-                "description": "REQUIRED for action=create. For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp. Examples: '30m' (every 30 minutes), 'every 2h' (every 2 hours), '0 9 * * *' (daily at 9am), '2026-06-01T09:00:00' (one-shot). You MUST include this field when action=create."
+                "description": "REQUIRED for action=create. For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp. Examples: '30m' (every 30 minutes), 'every 2h' (every 2 hours), '0 9 * * *' (daily at 9am), '2026-06-01T09:00:00' (one-shot). You MUST include this field when action=create. For a specific date/time like 'tonight at 02:00' or 'tomorrow at 9am', prefer an ISO timestamp over a date-pinned cron expression."
             },
             "name": {
                 "type": "string",
