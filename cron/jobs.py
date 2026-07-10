@@ -587,12 +587,20 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         # is_date_pinned_yearly_schedule).
         if len(parts) == 5 and is_date_pinned_cron_expr(schedule):
             now = _hermes_now()
-            # Anchor the same way compute_next_run anchors a fresh schedule
-            # (no last_run_at yet): base = _hermes_now(), which carries the
-            # configured Hermes tz, not server-local or UTC.
-            next_dt = croniter(schedule, now).get_next(datetime)
-            if next_dt - now <= timedelta(days=NEAR_TERM_ONE_SHOT_WINDOW_DAYS):
-                run_at = next_dt.isoformat()
+            # Anchor the same way the ISO one-shot branch anchors a naive
+            # timestamp: compute the wall-clock occurrence on a NAIVE base,
+            # then attach the configured Hermes tz. Feeding croniter a
+            # tz-AWARE base would carry the PRE-transition UTC offset across
+            # a DST boundary (e.g. Europe/Warsaw base +01:00, target after
+            # spring-forward), persisting a run_at one hour off the user's
+            # wall-clock intent — and converted one-shots have no
+            # self-healing (the kind=="cron" DST repair path never sees them).
+            now_naive = now.replace(tzinfo=None)
+            next_naive = croniter(schedule, now_naive).get_next(datetime)
+            # Naive-to-naive comparison keeps the ≤window check on the same
+            # (wall-clock) convention as the computation above.
+            if next_naive - now_naive <= timedelta(days=NEAR_TERM_ONE_SHOT_WINDOW_DAYS):
+                run_at = next_naive.replace(tzinfo=now.tzinfo).isoformat()
                 return {
                     "kind": "once",
                     "run_at": run_at,

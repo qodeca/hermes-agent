@@ -123,6 +123,49 @@ class TestNearTermDatePinnedConversion:
 
         assert result["kind"] == "cron"
 
+    def test_dst_spring_forward_preserves_wall_clock_hour(self, monkeypatch):
+        """DST-crossing conversion must preserve the user's wall-clock intent.
+
+        Regression: computing the next occurrence with a tz-AWARE base lets
+        croniter carry the PRE-transition UTC offset across the spring-forward
+        boundary, landing one hour early (01:00+02:00 instead of 02:00+02:00).
+        Converted one-shots have no self-healing (the DST repair path is gated
+        on kind=="cron"), so the persisted run_at would be silently wrong.
+        Europe/Warsaw springs forward 2026-03-29 02:00 CET -> 03:00 CEST.
+        """
+        zoneinfo = pytest.importorskip("zoneinfo")
+        tz = zoneinfo.ZoneInfo("Europe/Warsaw")
+        now = datetime(2026, 3, 1, 10, 0, 0, tzinfo=tz)  # CET, +01:00
+        monkeypatch.setattr("cron.jobs._hermes_now", _fixed_now(now))
+
+        result = parse_schedule("0 2 30 3 *")  # 2026-03-30, after transition
+
+        assert result["kind"] == "once"
+        run_at = datetime.fromisoformat(result["run_at"])
+        # Wall clock preserved: 02:00 local on March 30...
+        assert run_at.replace(tzinfo=None) == datetime(2026, 3, 30, 2, 0, 0)
+        # ...with the correct POST-transition offset (CEST, +02:00).
+        assert run_at.utcoffset() == timedelta(hours=2)
+
+    def test_dst_fall_back_preserves_wall_clock_hour(self, monkeypatch):
+        """Mirrored autumn case: base in CEST (+02:00), target after the
+        fall-back transition (2026-10-25 03:00 CEST -> 02:00 CET). The aware
+        base carried +02:00 across the boundary, landing at 03:00 local
+        instead of the requested 02:00."""
+        zoneinfo = pytest.importorskip("zoneinfo")
+        tz = zoneinfo.ZoneInfo("Europe/Warsaw")
+        now = datetime(2026, 10, 1, 10, 0, 0, tzinfo=tz)  # CEST, +02:00
+        monkeypatch.setattr("cron.jobs._hermes_now", _fixed_now(now))
+
+        result = parse_schedule("0 2 26 10 *")  # 2026-10-26, after transition
+
+        assert result["kind"] == "once"
+        run_at = datetime.fromisoformat(result["run_at"])
+        # Wall clock preserved: 02:00 local on October 26...
+        assert run_at.replace(tzinfo=None) == datetime(2026, 10, 26, 2, 0, 0)
+        # ...with the correct POST-transition offset (CET, +01:00).
+        assert run_at.utcoffset() == timedelta(hours=1)
+
     def test_six_field_expression_with_seconds_left_untouched(self, monkeypatch):
         """A 6-field expression (croniter appends seconds as the 6th field,
         confirmed: minute hour day month weekday second) is left untouched by
