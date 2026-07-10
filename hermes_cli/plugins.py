@@ -2076,6 +2076,22 @@ def has_hook(hook_name: str) -> bool:
 
 _thread_tool_whitelist = threading.local()
 
+# Circuit-breaker message for a whitelisted thread (background review fork)
+# that has retried denied privileged actions past ``max_denials``. Per OWASP
+# AI Agent guidance, retry-after-denial is an excessive-agency signal; this
+# message is terminal — once a thread sees it, the caller (background_review.py)
+# ends the fork on the next tool-round check rather than letting it keep
+# retrying variations of the same denied action (incident: 11 retries across
+# sessions mixing patch/write_file/patch against protected skills).
+DENIAL_ABORT_MESSAGE = "background review aborted: repeated denied privileged attempts"
+
+# Default cap on denied privileged attempts a single whitelisted thread may
+# accumulate before the breaker trips. Applies to every caller that doesn't
+# pass its own ``max_denials`` (today, that's every caller — see
+# set_thread_tool_whitelist's docstring for why unbounded retry is never the
+# desired default for a whitelisted thread).
+DEFAULT_MAX_TOOL_DENIALS = 5
+
 
 @dataclass(frozen=True)
 class _PreToolCallDirective:
@@ -2087,13 +2103,84 @@ class _PreToolCallDirective:
 def set_thread_tool_whitelist(
     allowed: Optional[Set[str]],
     deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
+    max_denials: int = DEFAULT_MAX_TOOL_DENIALS,
+    on_denial_exceeded: Optional[Callable[[List[str]], None]] = None,
 ) -> None:
+    """Install a per-thread tool whitelist (used by the background review fork).
+
+    ``max_denials`` bounds how many denied privileged attempts (whitelist
+    blocks, plus any in-tool guard denial that opts into the same counter via
+    :func:`record_thread_tool_denial`) this thread may accumulate before the
+    denial-breaker trips: further denials return :data:`DENIAL_ABORT_MESSAGE`
+    instead of ``deny_msg_fmt``, and ``on_denial_exceeded`` (if given) fires
+    once with the ordered list of denied tool/action names — the caller's
+    seam for aborting the run and alerting an operator. Every current
+    caller wants this cap (there is no legitimate reason for a whitelisted
+    thread to retry a denied privileged action unboundedly), so it defaults
+    on rather than requiring callers to opt in.
+    """
     _thread_tool_whitelist.allowed = allowed
     _thread_tool_whitelist.fmt = deny_msg_fmt
+    _thread_tool_whitelist.max_denials = max_denials
+    _thread_tool_whitelist.on_denial_exceeded = on_denial_exceeded
+    _thread_tool_whitelist.denial_count = 0
+    _thread_tool_whitelist.denied_tools = []
+    _thread_tool_whitelist.aborted = False
 
 
 def clear_thread_tool_whitelist() -> None:
     _thread_tool_whitelist.allowed = None
+    _thread_tool_whitelist.max_denials = DEFAULT_MAX_TOOL_DENIALS
+    _thread_tool_whitelist.on_denial_exceeded = None
+    _thread_tool_whitelist.denial_count = 0
+    _thread_tool_whitelist.denied_tools = []
+    _thread_tool_whitelist.aborted = False
+
+
+def record_thread_tool_denial(tool_name: str) -> Optional[str]:
+    """Record a denied privileged attempt against the active thread whitelist.
+
+    Shared seam for BOTH denial paths a whitelisted thread can hit:
+    the whitelist block in :func:`_get_pre_tool_call_directive_details`
+    calls this automatically, and in-tool guards that deny a privileged
+    action from *inside* an otherwise-whitelisted tool (e.g.
+    ``tools/skill_manager_tool.py``'s background-review write guard) call
+    it explicitly so both count toward the same breaker.
+
+    No-op (returns ``None``) when no whitelist is currently active for this
+    thread — i.e. outside a background review fork, unbounded retries are
+    not this breaker's concern.
+
+    Once the running count reaches ``max_denials``, the whitelist state is
+    marked aborted, the registered ``on_denial_exceeded`` callback (if any)
+    fires exactly once with the ordered list of denied names, and this call
+    — and every subsequent call on this thread until the whitelist is reset
+    — returns :data:`DENIAL_ABORT_MESSAGE` so callers can swap it in for
+    their own denial text.
+    """
+    denied_tools = getattr(_thread_tool_whitelist, "denied_tools", None)
+    if getattr(_thread_tool_whitelist, "allowed", None) is None or denied_tools is None:
+        return None
+
+    denied_tools.append(tool_name)
+    _thread_tool_whitelist.denial_count = getattr(_thread_tool_whitelist, "denial_count", 0) + 1
+    max_denials = getattr(_thread_tool_whitelist, "max_denials", DEFAULT_MAX_TOOL_DENIALS)
+
+    if _thread_tool_whitelist.denial_count >= max_denials:
+        already_aborted = getattr(_thread_tool_whitelist, "aborted", False)
+        _thread_tool_whitelist.aborted = True
+        if not already_aborted:
+            callback = getattr(_thread_tool_whitelist, "on_denial_exceeded", None)
+            if callback is not None:
+                try:
+                    callback(list(denied_tools))
+                except Exception:
+                    logger.debug(
+                        "on_denial_exceeded callback raised", exc_info=True
+                    )
+        return DENIAL_ABORT_MESSAGE
+
+    return None
 
 
 def _get_pre_tool_call_directive_details(
@@ -2134,10 +2221,15 @@ def _get_pre_tool_call_directive_details(
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
-        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
+        abort_message = record_thread_tool_denial(tool_name)
+        if abort_message:
+            message = abort_message
+        else:
+            fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
+            message = fmt.format(tool_name=tool_name)
         return _PreToolCallDirective(
             action="block",
-            message=fmt.format(tool_name=tool_name),
+            message=message,
         )
 
     hook_results = invoke_hook(

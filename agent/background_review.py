@@ -795,8 +795,41 @@ def _run_review_in_thread(
                     quiet_mode=True,
                 )
             }
+            def _abort_review_on_repeated_denials(denied: List[str]) -> None:
+                """Circuit breaker (finding 16): the review fork retried
+                denied privileged writes unboundedly across sessions
+                (patch -> write_file -> patch variations against protected
+                skills) -- per OWASP AI Agent guidance, retry-after-denial
+                is an excessive-agency signal that needs a hard stop, not
+                just a log line.
+
+                Sets the same interrupt flag ``run_conversation``'s tool
+                loop already checks at the top of every round (see
+                ``agent/conversation_loop.py``), so the fork ends on a
+                clean turn boundary -- no synthetic message injected, no
+                broken role alternation -- exactly like the existing
+                budget/user-interrupt breakers. Fires once (the counter in
+                hermes_cli.plugins guarantees that), so this alert is not
+                spammed on every denial after the threshold.
+                """
+                if review_agent is not None:
+                    review_agent._interrupt_requested = True
+                try:
+                    from hermes_cli.operator_alerts import send_operator_alert
+                    send_operator_alert(
+                        "Background review aborted: repeated denied "
+                        "privileged attempts",
+                        "Denied tool/action calls: " + ", ".join(denied),
+                    )
+                except Exception:
+                    logger.debug(
+                        "operator alert for review denial breaker failed",
+                        exc_info=True,
+                    )
+
             set_thread_tool_whitelist(
                 review_whitelist,
+                on_denial_exceeded=_abort_review_on_repeated_denials,
                 deny_msg_fmt=(
                     "Background review denied non-whitelisted tool: "
                     "{tool_name}. Only memory/skill tools are allowed."

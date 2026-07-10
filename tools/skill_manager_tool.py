@@ -294,6 +294,36 @@ def _pinned_guard(name: str) -> Optional[str]:
     return None
 
 
+def _deny_background_review_write(action: str, error: str) -> Dict[str, Any]:
+    """Build a denial result and count it toward the review fork's shared
+    denial breaker (``hermes_cli.plugins.record_thread_tool_denial``).
+
+    These denials never reach ``_get_pre_tool_call_directive_details`` (the
+    whitelist-block path) because ``skill_manage`` itself IS whitelisted for
+    the review fork -- the refusal happens *inside* the tool call. They are,
+    however, exactly the "retry-after-denial" pattern the breaker exists for
+    (incident: 11 retries across sessions mixing patch/write_file/patch
+    against protected skills), so they count against the same threshold via
+    this seam. Recorded as ``skill_manage:{action}`` rather than the bare
+    tool name so an operator alert shows which privileged actions were
+    retried, not just that "skill_manage" was denied repeatedly.
+
+    ``record_thread_tool_denial`` is a no-op outside a whitelisted thread, so
+    this is safe to call unconditionally -- but this helper is only ever
+    reached after ``is_background_review()`` is already True (see call
+    sites), so it always counts in practice.
+    """
+    result: Dict[str, Any] = {"success": False, "error": error}
+    try:
+        from hermes_cli.plugins import record_thread_tool_denial
+        abort_message = record_thread_tool_denial(f"skill_manage:{action}")
+        if abort_message:
+            result["error"] = abort_message
+    except Exception:
+        logger.debug("denial-breaker recording failed for %s", action, exc_info=True)
+    return result
+
+
 def _background_review_write_guard(
     name: str,
     skill_dir: Path,
@@ -322,58 +352,48 @@ def _background_review_write_guard(
     try:
         from tools import skill_usage
         if skill_usage.get_record(name).get("pinned"):
-            return {
-                "success": False,
-                "error": (
-                    f"Refusing background curator {action} for pinned skill "
-                    f"'{name}': pinned skills are off-limits to autonomous "
-                    "maintenance. Ask the user to run "
-                    f"`hermes curator unpin {name}` if they want it changed."
-                ),
-            }
+            return _deny_background_review_write(
+                action,
+                f"Refusing background curator {action} for pinned skill "
+                f"'{name}': pinned skills are off-limits to autonomous "
+                "maintenance. Ask the user to run "
+                f"`hermes curator unpin {name}` if they want it changed.",
+            )
     except Exception:
         logger.debug("pinned skill guard lookup failed for %s", name, exc_info=True)
 
     try:
         from agent.skill_utils import is_external_skill_path
         if is_external_skill_path(skill_dir):
-            return {
-                "success": False,
-                "error": (
-                    f"Refusing background curator {action} for skill '{name}': "
-                    "the skill lives in skills.external_dirs, which are "
-                    "externally owned and read-only to autonomous curation."
-                ),
-            }
+            return _deny_background_review_write(
+                action,
+                f"Refusing background curator {action} for skill '{name}': "
+                "the skill lives in skills.external_dirs, which are "
+                "externally owned and read-only to autonomous curation.",
+            )
     except Exception:
         logger.debug("external skill guard lookup failed for %s", name, exc_info=True)
 
     try:
         from tools import skill_usage
         if skill_usage.is_protected_builtin(name):
-            return {
-                "success": False,
-                "error": (
-                    f"Refusing background curator {action} for protected "
-                    f"built-in skill '{name}'."
-                ),
-            }
+            return _deny_background_review_write(
+                action,
+                f"Refusing background curator {action} for protected "
+                f"built-in skill '{name}'.",
+            )
         if skill_usage.is_hub_installed(name):
-            return {
-                "success": False,
-                "error": (
-                    f"Refusing background curator {action} for hub-installed "
-                    f"skill '{name}'."
-                ),
-            }
+            return _deny_background_review_write(
+                action,
+                f"Refusing background curator {action} for hub-installed "
+                f"skill '{name}'.",
+            )
         if skill_usage.is_bundled(name):
-            return {
-                "success": False,
-                "error": (
-                    f"Refusing background curator {action} for bundled "
-                    f"skill '{name}'."
-                ),
-            }
+            return _deny_background_review_write(
+                action,
+                f"Refusing background curator {action} for bundled "
+                f"skill '{name}'.",
+            )
     except Exception:
         logger.debug("owned skill guard lookup failed for %s", name, exc_info=True)
     return None
