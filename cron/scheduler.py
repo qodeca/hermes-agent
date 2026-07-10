@@ -241,6 +241,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 
 from cron.jobs import (
     get_due_jobs,
+    drain_skip_notices,
     mark_job_run,
     save_job_output,
     advance_next_run,
@@ -3770,10 +3771,47 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
+def _deliver_pending_skip_notices(adapters=None, loop=None) -> int:
+    """Deliver notices for recurring runs skipped via ``misfire_deadline_seconds``.
+
+    ``cron/jobs.py:_get_due_jobs_locked`` records a skip (job past its
+    opt-in misfire deadline — see #33315 for why the *default* behavior is
+    still fire-once-past-grace) instead of delivering inline, because that
+    function runs under the cross-process ``_jobs_lock()`` and must not do
+    network I/O while holding it. This drains those recorded events and
+    delivers each one through the normal ``_deliver_result`` path, same as a
+    failed run's summary — just called from ``tick()`` right after
+    ``get_due_jobs()`` returns, once the lock is no longer held.
+
+    Returns the number of notices delivered (attempted; delivery failures are
+    logged, not raised — a skip notice is best-effort, same as any other cron
+    delivery).
+    """
+    events = drain_skip_notices()
+    for event in events:
+        job = event["job"]
+        notice = event["notice"]
+        try:
+            delivery_error = _deliver_result(job, notice, adapters=adapters, loop=loop)
+            if delivery_error:
+                logger.warning(
+                    "Job '%s': failed to deliver stale-skip notice: %s",
+                    job.get("name", job.get("id", "?")),
+                    delivery_error,
+                )
+        except Exception as e:
+            logger.error(
+                "Job '%s': error delivering stale-skip notice: %s",
+                job.get("name", job.get("id", "?")),
+                e,
+            )
+    return len(events)
+
+
 def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
     """
     Check and run all due jobs.
-    
+
     Uses a file lock so only one tick runs at a time, even if the gateway's
     in-process ticker and a standalone daemon or manual tick overlap.
     
@@ -3804,6 +3842,13 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
 
     try:
         due_jobs = get_due_jobs()
+
+        # Deliver any stale-run skip notices recorded during the scan above
+        # (misfire_deadline_seconds). Must run regardless of whether any job
+        # is due, and before the early-return below, since a skip means the
+        # job is NOT in due_jobs. get_due_jobs()'s _jobs_lock() is already
+        # released by this point, so this is safe network I/O.
+        _deliver_pending_skip_notices(adapters=adapters, loop=loop)
 
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))

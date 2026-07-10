@@ -1114,6 +1114,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    misfire_deadline_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1158,6 +1159,15 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        misfire_deadline_seconds: Optional, recurring (cron/interval) jobs only.
+                None (default) preserves the existing fire-once-past-grace
+                behavior (#33315): a stale run still fires once. When set to a
+                positive integer, a run later than this many seconds past its
+                scheduled slot is skipped entirely instead of fired — the
+                catch-up fast-forward to the next occurrence still happens,
+                but no stale run executes. Use this for time-sensitive jobs
+                (e.g. a morning greeting) where firing hours late is worse
+                than not firing.
 
     Returns:
         The created job dict
@@ -1190,6 +1200,21 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+
+    # Validate misfire_deadline_seconds: None (default, unchanged behavior) or
+    # a positive int. Reject zero/negative/non-int (including bool — see the
+    # isinstance guard in _get_due_jobs_locked) up front so a bad value never
+    # reaches the scheduler, where it would silently never trigger (0/negative)
+    # or crash a comparison (wrong type).
+    if misfire_deadline_seconds is not None and (
+        isinstance(misfire_deadline_seconds, bool)
+        or not isinstance(misfire_deadline_seconds, int)
+        or misfire_deadline_seconds <= 0
+    ):
+        raise ValueError(
+            "misfire_deadline_seconds must be a positive integer (seconds) or None, "
+            f"got {misfire_deadline_seconds!r}"
+        )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1279,6 +1304,7 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "misfire_deadline_seconds": misfire_deadline_seconds,
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
@@ -1796,6 +1822,33 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
         return False
 
 
+# Recurring jobs skipped for being past their opt-in `misfire_deadline_seconds`
+# (see `_get_due_jobs_locked` below) are recorded here instead of being
+# delivered inline. Delivery needs network I/O, and `_get_due_jobs_locked`
+# runs under `_jobs_lock()` — a cross-process file lock — so it must not do
+# network I/O while holding it. `cron/scheduler.py`'s `tick()` drains this
+# list via `drain_skip_notices()` right after `get_due_jobs()` returns (lock
+# already released) and delivers each notice through the normal delivery
+# path. Guarded by `_jobs_lock()` itself on both the producer and consumer
+# side so concurrent in-process tick threads can't interleave a partial
+# drain with a concurrent append.
+_pending_skip_events: List[Dict[str, Any]] = []
+
+
+def drain_skip_notices() -> List[Dict[str, Any]]:
+    """Atomically pop and return skip-stale notices recorded by recent
+    ``get_due_jobs()`` scans.
+
+    Each entry is ``{"job": <job dict>, "notice": <one-line str>}``. Intended
+    to be called once per tick, after ``get_due_jobs()`` returns, so the
+    caller can deliver the notices outside any lock.
+    """
+    with _jobs_lock():
+        events = list(_pending_skip_events)
+        _pending_skip_events.clear()
+    return events
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
@@ -1809,6 +1862,13 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 
     Note: firing once on catch-up flows through ``mark_job_run``, so a job with
     a ``repeat.times`` limit consumes one of its runs on that catch-up fire.
+
+    A job may opt out of that fire-once behavior via its ``misfire_deadline_seconds``
+    field (None by default, preserving the above): when set and the job is
+    later than that many seconds past its scheduled slot, the run is skipped
+    entirely instead of fired — see the catch-up branch below. The skip is
+    recorded for delivery via ``drain_skip_notices()`` rather than delivered
+    here.
     """
     with _jobs_lock():
         return _get_due_jobs_locked()
@@ -1942,20 +2002,57 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # the next future occurrence instead of firing a stale run.
             grace = _compute_grace_seconds(schedule)
             if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
+                lateness_seconds = (now - next_run_dt).total_seconds()
+                # Opt-in override of the fire-once-past-grace behavior below
+                # (#33315, deliberate default). A 06:00 greeting that fires
+                # at 09:45 after an outage is worse than not firing at all —
+                # a job can set misfire_deadline_seconds to say "past this
+                # many seconds late, skip the run instead of firing stale."
+                # None/absent (the default) preserves today's behavior
+                # exactly. Bool excluded: isinstance(True, int) is True in
+                # Python, and a bare True/False here is a misconfigured
+                # field, not an intentional 1/0-second deadline.
+                misfire_deadline = job.get("misfire_deadline_seconds")
+                skip_stale = (
+                    isinstance(misfire_deadline, int)
+                    and not isinstance(misfire_deadline, bool)
+                    and misfire_deadline > 0
+                    and lateness_seconds > misfire_deadline
+                )
                 # Job is past its catch-up grace window — skip accumulated
                 # missed runs but still execute once now to avoid deferring
-                # indefinitely (e.g. a long-running job just finished).
+                # indefinitely (e.g. a long-running job just finished) —
+                # unless skip_stale (above) opts out of firing altogether.
                 new_next = compute_next_run(schedule, now.isoformat())
                 if new_next:
-                    logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Running now; next run provisionally set to: %s "
-                        "(re-anchored on completion)",
-                        job.get("name", job["id"]),
-                        next_run,
-                        grace,
-                        new_next,
-                    )
+                    if skip_stale:
+                        skip_notice = (
+                            f"Cron '{job.get('name', job['id'])}' skipped a stale run: "
+                            f"it was due at {next_run} and is "
+                            f"{int(lateness_seconds)}s late, past its "
+                            f"misfire_deadline_seconds={misfire_deadline}. "
+                            f"Next run: {new_next}."
+                        )
+                        logger.info(
+                            "Job '%s' missed its scheduled time (%s) by %ds — "
+                            "past misfire_deadline_seconds=%d, skipping this "
+                            "run; next run set to: %s",
+                            job.get("name", job["id"]),
+                            next_run,
+                            int(lateness_seconds),
+                            misfire_deadline,
+                            new_next,
+                        )
+                    else:
+                        logger.info(
+                            "Job '%s' missed its scheduled time (%s, grace=%ds). "
+                            "Running now; next run provisionally set to: %s "
+                            "(re-anchored on completion)",
+                            job.get("name", job["id"]),
+                            next_run,
+                            grace,
+                            new_next,
+                        )
                     # Persist the fast-forward to storage now (skip accumulated
                     # slots). In the built-in ticker path this is shortly
                     # overwritten by advance_next_run + mark_job_run, but it is
@@ -1967,8 +2064,25 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     for rj in raw_jobs:
                         if rj["id"] == job["id"]:
                             rj["next_run_at"] = new_next
+                            if skip_stale:
+                                rj["last_status"] = "skipped_stale"
+                                rj["last_error"] = skip_notice
                             needs_save = True
                             break
+                    if skip_stale:
+                        # Do NOT append to `due` — record the skip for
+                        # cron/scheduler.py's tick() to deliver a one-line
+                        # notice AFTER get_due_jobs() returns and this
+                        # function's _jobs_lock() has been released (see
+                        # drain_skip_notices()'s docstring — no network I/O
+                        # under this lock).
+                        job["next_run_at"] = new_next
+                        job["last_status"] = "skipped_stale"
+                        job["last_error"] = skip_notice
+                        _pending_skip_events.append(
+                            {"job": copy.deepcopy(job), "notice": skip_notice}
+                        )
+                        continue  # next job — skip claim/marker/due-append below
                     # Fall through to due.append(job) — execute once now
 
             # One-shot dispatch-limit guard (issue #38758): a finite one-shot
