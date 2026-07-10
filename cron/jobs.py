@@ -1882,6 +1882,61 @@ def _cron_output_keep() -> int:
         return _CRON_OUTPUT_DEFAULT_KEEP
 
 
+# A trivial cron job once persisted 261 KB of raw model deliberation as its
+# stored output (finding 15) — the retention above bounds run *count*, but a
+# single run's on-disk artifact had no byte cap. Cap it independently: when
+# a run's output exceeds the budget, keep the head and tail (the parts most
+# likely to carry the outcome) and elide the noisy middle.
+_CRON_OUTPUT_DEFAULT_MAX_BYTES = 262144  # 256 KiB
+_CRON_OUTPUT_HEAD_FRACTION = 0.6
+_CRON_OUTPUT_TAIL_FRACTION = 0.3
+
+
+def _cron_output_max_bytes() -> int:
+    """Resolve the per-run stored-output byte cap from config (``cron.output_max_bytes``)."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return int(cron_cfg.get("output_max_bytes", _CRON_OUTPUT_DEFAULT_MAX_BYTES))
+    except Exception:
+        return _CRON_OUTPUT_DEFAULT_MAX_BYTES
+
+
+def _cap_output_bytes(output: str, max_bytes: int) -> str:
+    """Truncate *output* to at most *max_bytes* UTF-8-encoded bytes.
+
+    Keeps the first ``_CRON_OUTPUT_HEAD_FRACTION`` and last
+    ``_CRON_OUTPUT_TAIL_FRACTION`` of the budget, joined by an elision marker
+    line reporting how many bytes were dropped from the middle. This bounds
+    only the STORED run-output file (``save_job_output``) — the delivered
+    chat text (``final_response``) is a different string, bounded separately
+    by the per-turn token budget, and is untouched here.
+
+    A non-positive *max_bytes* disables capping (opt-out, mirrors
+    ``_prune_job_output``'s ``keep <= 0`` convention).
+
+    Truncation slices the UTF-8-encoded bytes, not characters, so a cut can
+    land inside a multi-byte sequence (emoji, non-ASCII scripts); decoding
+    each half with ``errors="ignore"`` drops any partial sequence left
+    dangling at a slice edge instead of raising or corrupting the file.
+    """
+    if max_bytes <= 0:
+        return output
+    encoded = output.encode("utf-8")
+    total = len(encoded)
+    if total <= max_bytes:
+        return output
+
+    head_bytes = int(max_bytes * _CRON_OUTPUT_HEAD_FRACTION)
+    tail_bytes = int(max_bytes * _CRON_OUTPUT_TAIL_FRACTION)
+    elided = total - head_bytes - tail_bytes
+    head = encoded[:head_bytes].decode("utf-8", errors="ignore")
+    tail = encoded[total - tail_bytes:].decode("utf-8", errors="ignore")
+    marker = f"\n[... {elided} bytes elided by cron.output_max_bytes ...]\n"
+    return head + marker + tail
+
+
 def _prune_job_output(job_output_dir: Path, keep: int) -> int:
     """Remove the oldest ``*.md`` run-output files beyond *keep*. Returns count deleted.
 
@@ -1921,10 +1976,12 @@ def save_job_output(job_id: str, output: str):
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
 
+    stored_output = _cap_output_bytes(output, _cron_output_max_bytes())
+
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(output)
+            f.write(stored_output)
             f.flush()
             os.fsync(f.fileno())
         atomic_replace(tmp_path, output_file)
