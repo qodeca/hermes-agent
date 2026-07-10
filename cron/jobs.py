@@ -1916,6 +1916,14 @@ def _cap_output_bytes(output: str, max_bytes: int) -> str:
     A non-positive *max_bytes* disables capping (opt-out, mirrors
     ``_prune_job_output``'s ``keep <= 0`` convention).
 
+    The marker is budgeted INTO the cap: its byte length — conservatively
+    estimated by formatting it with the largest possible elided count
+    (``total``; the marker is pure ASCII, so ``len(str)`` == bytes) — is
+    subtracted from *max_bytes* before the 60/30 split, so the written
+    string is always <= *max_bytes*. A pathological cap too small to fit
+    even the marker degrades to a bare head truncated to the cap (no
+    marker).
+
     Truncation slices the UTF-8-encoded bytes, not characters, so a cut can
     land inside a multi-byte sequence (emoji, non-ASCII scripts); decoding
     each half with ``errors="ignore"`` drops any partial sequence left
@@ -1928,8 +1936,14 @@ def _cap_output_bytes(output: str, max_bytes: int) -> str:
     if total <= max_bytes:
         return output
 
-    head_bytes = int(max_bytes * _CRON_OUTPUT_HEAD_FRACTION)
-    tail_bytes = int(max_bytes * _CRON_OUTPUT_TAIL_FRACTION)
+    marker_reserve = len(f"\n[... {total} bytes elided by cron.output_max_bytes ...]\n")
+    budget = max_bytes - marker_reserve
+    if budget <= 0:
+        # No room for head + marker + tail: degrade to a bare head.
+        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+    head_bytes = int(budget * _CRON_OUTPUT_HEAD_FRACTION)
+    tail_bytes = int(budget * _CRON_OUTPUT_TAIL_FRACTION)
     elided = total - head_bytes - tail_bytes
     head = encoded[:head_bytes].decode("utf-8", errors="ignore")
     tail = encoded[total - tail_bytes:].decode("utf-8", errors="ignore")
