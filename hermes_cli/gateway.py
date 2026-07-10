@@ -236,6 +236,74 @@ def _is_pid_ancestor_of_current_process(target_pid: int) -> bool:
     return False
 
 
+# Cap the ancestry walk used by the restart/stop self-targeting guard. The
+# guard only needs to spot "we're a few hops below the gateway process"
+# (gateway -> agent loop -> terminal tool -> shell -> hermes CLI), not walk
+# all the way to PID 1 — keeping this bounded matters because the ``ps``
+# fallback in ``_get_parent_pid`` shells out once per hop.
+_RESTART_GUARD_MAX_ANCESTRY_DEPTH = 10
+
+
+def _ancestor_pids(max_depth: int = _RESTART_GUARD_MAX_ANCESTRY_DEPTH) -> list[int]:
+    """Return this process's own PID plus up to ``max_depth`` parent PIDs.
+
+    Each hop is resolved via ``_get_parent_pid`` (psutil, falling back to
+    ``/bin/ps -o ppid=``). Stops early on a repeated PID (cycle) or once a
+    parent can't be determined.
+    """
+    pid = os.getpid()
+    chain = [pid]
+    seen = {pid}
+    for _ in range(max_depth):
+        parent = _get_parent_pid(pid)
+        if not parent or parent in seen:
+            break
+        chain.append(parent)
+        seen.add(parent)
+        pid = parent
+    return chain
+
+
+def _invoked_from_within_gateway() -> bool:
+    """Detect whether this CLI invocation is running inside the gateway's own
+    process tree — the condition the ``gateway stop``/``restart``
+    self-targeting guard refuses on.
+
+    Primary signal: the ``_HERMES_GATEWAY=1`` env var the gateway sets on
+    itself and its children. A child context that strips env vars before
+    invoking this CLI (e.g. a sandboxed terminal-tool backend) would defeat
+    an env-only check, so this also resolves the recorded gateway PID from
+    ``gateway.pid`` (via ``gateway.status.get_running_pid`` — profile/
+    HERMES_HOME-aware, and already validates the recorded process is alive
+    and its start time matches) and checks whether it appears in this
+    process's own ancestry.
+
+    Either signal refuses. Any failure along the ancestry path (psutil
+    unavailable, ``ps`` missing, no PID file, corrupt state, ...) falls back
+    to the env check alone — this must never make the command unusable for a
+    human operator at a real shell.
+    """
+    if os.getenv("_HERMES_GATEWAY") == "1":
+        return True
+    try:
+        from gateway.status import get_running_pid
+
+        gateway_pid = get_running_pid(cleanup_stale=False)
+        if not gateway_pid:
+            return False
+        # Small residual race, accepted rather than paying for a second
+        # create-time check per ancestor: an intermediate ancestor's PID
+        # could in theory be reused to coincide with the recorded gateway
+        # PID between resolving it above and walking the ancestry below.
+        # get_running_pid() already cross-checks the recorded PID against a
+        # live process's start time, so this only matters for the far
+        # narrower window where an *ancestor's own* PID was independently
+        # reused in that instant.
+        return gateway_pid in _ancestor_pids()
+    except Exception:
+        return False
+
+
 def _request_gateway_self_restart(pid: int) -> bool:
     """Ask a running gateway ancestor to restart itself asynchronously."""
     if not hasattr(signal, "SIGUSR1"):
@@ -6874,8 +6942,11 @@ def _gateway_command_inner(args):
 
     elif subcmd == "restart":
         # Defense: refuse self-targeting gateway restart from inside the gateway.
-        # Prevents agent-initiated kill loops when combined with supervisor KeepAlive.
-        if os.getenv("_HERMES_GATEWAY") == "1":
+        # Prevents agent-initiated kill loops when combined with supervisor
+        # KeepAlive. Checks both the _HERMES_GATEWAY=1 env marker and process
+        # ancestry against the recorded gateway PID — a child context that
+        # strips env vars would otherwise defeat an env-only check.
+        if _invoked_from_within_gateway():
             print_error(
                 "Refusing to restart the gateway from inside the gateway process.\n"
                 "This command was blocked to prevent restart loops.\n"
