@@ -268,7 +268,11 @@ def test_resolved_api_call_stale_timeout_priority(monkeypatch, tmp_path):
     assert agent2._resolved_api_call_stale_timeout_base() == (90.0, True)
 
 
-def test_default_non_stream_stale_timeout_auto_disables_for_local_endpoints(monkeypatch, tmp_path):
+def test_default_non_stream_stale_timeout_floors_for_local_endpoints(monkeypatch, tmp_path):
+    """Local endpoints on the implicit default no longer disable the
+    stale-call detector outright (T7/finding 23) — a fully-unguarded call
+    is never acceptable, so this floors at a generous 900s ceiling instead
+    of float('inf')."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
     monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
@@ -285,7 +289,9 @@ def test_default_non_stream_stale_timeout_auto_disables_for_local_endpoints(monk
         platform="cli",
     )
 
-    assert agent._compute_non_stream_stale_timeout([]) == float("inf")
+    timeout = agent._compute_non_stream_stale_timeout([])
+    assert timeout == 900.0
+    assert timeout != float("inf")
 
 
 def test_explicit_non_stream_stale_timeout_is_honored_for_local_endpoints(monkeypatch, tmp_path):

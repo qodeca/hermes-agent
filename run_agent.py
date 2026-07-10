@@ -1282,7 +1282,12 @@ class AIAgent:
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
-            return float("inf")
+            # Local endpoints have historically disabled the stale-call
+            # detector outright (no cloud-gateway idle-kill risk to guard
+            # against). A fully-unguarded call is never acceptable though —
+            # a hung local backend still needs a ceiling, just a generous
+            # one — so floor at 900s instead of float("inf").
+            return max(stale_base, 900.0)
 
         from agent.chat_completion_helpers import estimate_request_context_tokens
         est_tokens = estimate_request_context_tokens(api_payload)
@@ -4395,7 +4400,7 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._resolved_api_call_timeout(),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -4517,7 +4522,7 @@ class AIAgent:
             self._anthropic_base_url = runtime_base
             self._anthropic_client = build_anthropic_client(
                 runtime_key, runtime_base,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._resolved_api_call_timeout(),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -4586,7 +4591,7 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._resolved_api_call_timeout(),
                 drop_context_1m_beta=_drop_1m,
             )
 
