@@ -2679,8 +2679,8 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
-        # Byte cap on a single run's STORED output file (save_job_output;
-        # finding 15 — a trivial cron job once persisted 261 KB of raw model
+        # Byte cap on a single run's STORED output file (save_job_output —
+        # a trivial cron job once persisted 261 KB of raw model
         # deliberation as its stored output, with no cap on a single run's
         # size). When the UTF-8-encoded output exceeds this, the first 60%
         # and last 30% of the budget are kept and the elided middle is

@@ -2001,7 +2001,7 @@ def _cron_output_keep() -> int:
 
 
 # A trivial cron job once persisted 261 KB of raw model deliberation as its
-# stored output (finding 15) — the retention above bounds run *count*, but a
+# stored output — the retention above bounds run *count*, but a
 # single run's on-disk artifact had no byte cap. Cap it independently: when
 # a run's output exceeds the budget, keep the head and tail (the parts most
 # likely to carry the outcome) and elide the noisy middle.
