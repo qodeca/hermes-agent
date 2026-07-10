@@ -96,36 +96,111 @@ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
-# Fallback stale-recovery window for a one-shot's running-claim (#59229) when
-# the cron inactivity timeout is disabled (HERMES_CRON_TIMEOUT=0 → unlimited),
-# in which case no finite run bound exists to derive from. Also acts as the
-# floor for the derived value so a very short configured timeout can't make the
-# claim expire mid-run.
+# Fallback stale-recovery window for a run claim (#59229) when neither the
+# cron inactivity timeout nor the wall-clock runtime cap yields a
+# finite bound to derive from (both configured "unlimited"). Also acts as the
+# floor for the derived value so a very short configured timeout/cap can't
+# make the claim expire mid-run. Shared by the one-shot ``run_claim`` due-skip
+# guard and the recurring ``running_marker`` visibility marker.
 ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
 
-# The derived TTL is the cron inactivity timeout times this headroom multiplier.
-# A healthy run clears its claim via mark_job_run() long before the TTL; the
-# TTL only recovers a claim left by a tick that DIED mid-run. HERMES_CRON_TIMEOUT
-# is an *inactivity* limit, not a wall-clock cap — a job that keeps producing
-# output legitimately runs past it — so the multiplier gives comfortable
-# headroom over any healthy run before we treat a claim as stale.
+# The inactivity-derived term is HERMES_CRON_TIMEOUT times this headroom
+# multiplier. A healthy run clears its claim/marker via mark_job_run() long
+# before the TTL; the TTL only recovers state left by a tick that DIED
+# mid-run. HERMES_CRON_TIMEOUT is an *inactivity* limit, not a wall-clock cap
+# — a job that keeps producing output legitimately runs past it — so the
+# multiplier gives comfortable headroom over any healthy run before we treat
+# a claim/marker as stale.
 _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
+
+# The wall-clock-derived term is the cron max-runtime cap (T4,
+# _resolve_cron_max_runtime) times this headroom multiplier. Unlike the
+# inactivity timeout, the runtime cap already bounds a run's TOTAL wall-clock
+# time, so a smaller multiplier than the inactivity headroom is enough
+# comfortable margin over a run that legitimately used its full budget.
+_RUN_CLAIM_TTL_RUNTIME_HEADROOM = 1.5
 
 _DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
 
+# Default wall-clock runtime cap (seconds) — mirrors cron/scheduler.py's
+# _resolve_cron_max_runtime default. Kept in sync manually; both live under
+# cron/ and change together.
+_DEFAULT_CRON_MAX_RUNTIME = 3600.0
 
-def _oneshot_run_claim_ttl_seconds() -> float:
-    """Resolve the one-shot running-claim stale-recovery TTL.
 
-    Derived from ``HERMES_CRON_TIMEOUT`` (the cron inactivity timeout the
-    scheduler enforces on each run) so the safety valve tracks how long a run
-    is actually allowed to go quiet, instead of a magic constant:
+def _resolve_cron_max_runtime(cfg: dict | None) -> float | None:
+    """Resolve the cron wall-clock runtime cap: env > config > default.
 
-    - unset / invalid → default 600s inactivity limit → TTL = 1800s
-    - ``0`` (unlimited runs) → no finite bound to derive from → fall back to
-      ``ONESHOT_RUN_CLAIM_TTL_SECONDS``
-    - positive N → ``max(N * headroom, ONESHOT_RUN_CLAIM_TTL_SECONDS)`` so a
-      tiny configured timeout can never expire a claim mid-run.
+    Lives here (not cron/scheduler.py) because ``cron/jobs.py`` is the lower
+    storage layer that ``cron/scheduler.py`` imports from — jobs.py must not
+    import scheduler.py — and ``_run_claim_ttl_seconds`` below needs this
+    resolution to derive its wall-clock-aware term. ``cron/scheduler.py``
+    imports this function from here so there is exactly one implementation.
+
+    Unlike the inactivity timeout (HERMES_CRON_TIMEOUT, reset by every
+    API/tool/stream event), this bounds the TOTAL wall-clock runtime of a
+    single job run regardless of activity — the only backstop for a job
+    that stays "active" (e.g. retrying a slow/hanging backend call in a
+    loop) without ever going idle long enough to trip the inactivity path.
+
+    Resolution order: HERMES_CRON_MAX_RUNTIME env > cron.max_runtime_seconds
+    config > 3600s default. 0 (from either source) means unlimited — the
+    inactivity timeout is then the only bound. Mirrors the
+    HERMES_CRON_TIMEOUT env-parsing convention: an invalid (non-numeric)
+    value logs a warning and falls back to the hardcoded default rather
+    than raising.
+
+    Returns None for "unlimited", else the limit in seconds.
+    """
+    _raw = os.getenv("HERMES_CRON_MAX_RUNTIME", "").strip()
+    if _raw:
+        try:
+            _val = float(_raw)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_MAX_RUNTIME=%r; using default %.0fs",
+                _raw, _DEFAULT_CRON_MAX_RUNTIME,
+            )
+            _val = _DEFAULT_CRON_MAX_RUNTIME
+        return _val if _val > 0 else None
+
+    _cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    _cron_cfg = _cron_cfg if isinstance(_cron_cfg, dict) else {}
+    _configured = _cron_cfg.get("max_runtime_seconds")
+    if _configured is None:
+        return _DEFAULT_CRON_MAX_RUNTIME
+    try:
+        _val = float(_configured)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid cron.max_runtime_seconds=%r in config; using default %.0fs",
+            _configured, _DEFAULT_CRON_MAX_RUNTIME,
+        )
+        _val = _DEFAULT_CRON_MAX_RUNTIME
+    return _val if _val > 0 else None
+
+
+def _run_claim_ttl_seconds() -> float:
+    """Resolve the run-claim / running-marker stale-recovery TTL.
+
+    Shared by the one-shot ``run_claim`` due-skip guard (#59229) and the
+    recurring ``running_marker`` visibility marker (T2): both need a
+    "how long before we treat this claim as abandoned by a dead tick"
+    bound, derived from how long a run is actually allowed to take instead
+    of a magic constant.
+
+    Two independent axes feed the bound — a run that dies mid-flight can be
+    running quietly (inactivity) or busily against a hung backend (wall
+    clock), and either can legitimately run close to its configured limit:
+
+    - inactivity axis: ``HERMES_CRON_TIMEOUT * 3`` (unset/invalid → default
+      600s inactivity limit → 1800s; ``0`` unlimited → axis excluded)
+    - wall-clock axis: cron's max-runtime cap (T4, ``_resolve_cron_max_runtime``)
+      ``* 1.5`` (unlimited → axis excluded)
+
+    The TTL is the max of whichever axes are finite, floored at
+    ``ONESHOT_RUN_CLAIM_TTL_SECONDS``. If BOTH axes are unlimited, the floor
+    is the only bound.
     """
     raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
     timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
@@ -134,13 +209,19 @@ def _oneshot_run_claim_ttl_seconds() -> float:
             timeout = float(raw)
         except (ValueError, TypeError):
             timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
-    if timeout <= 0:
-        # Unlimited runs — cannot bound; use the fixed fallback floor.
-        return float(ONESHOT_RUN_CLAIM_TTL_SECONDS)
-    return max(
-        timeout * _ONESHOT_RUN_CLAIM_TTL_HEADROOM,
-        float(ONESHOT_RUN_CLAIM_TTL_SECONDS),
-    )
+    inactivity_term = timeout * _ONESHOT_RUN_CLAIM_TTL_HEADROOM if timeout > 0 else None
+
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config() or {}
+    except Exception:
+        _cfg = {}
+    max_runtime = _resolve_cron_max_runtime(_cfg)
+    runtime_term = max_runtime * _RUN_CLAIM_TTL_RUNTIME_HEADROOM if max_runtime else None
+
+    candidates = [t for t in (inactivity_term, runtime_term) if t is not None]
+    candidates.append(float(ONESHOT_RUN_CLAIM_TTL_SECONDS))
+    return max(candidates)
 
 
 def _jobs_lock_file() -> Path:
@@ -1401,7 +1482,13 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # is claimable again. No-op if the job never carried a claim.
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
-                
+                # Clear the recurring running-marker (T2): the run is over —
+                # last_status above already reflects the outcome ("ok"/"error"),
+                # so there is nothing else to reconcile. No-op if the job never
+                # carried a marker (one-shots never do).
+                if job.get("running_marker") is not None:
+                    job["running_marker"] = None
+
                 # Increment completed count.  Finite one-shot jobs are
                 # pre-claimed by claim_dispatch() BEFORE the side effect runs
                 # (issue #38758), which already incremented completed — do not
@@ -1656,9 +1743,10 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
     due = []
     needs_save = False
-    # Resolve the one-shot running-claim stale-recovery TTL once per scan
-    # (derived from HERMES_CRON_TIMEOUT). See _oneshot_run_claim_ttl_seconds.
-    _run_claim_ttl = _oneshot_run_claim_ttl_seconds()
+    # Resolve the run-claim / running-marker stale-recovery TTL once per scan
+    # (derived from HERMES_CRON_TIMEOUT and the wall-clock runtime cap). See
+    # _run_claim_ttl_seconds.
+    _run_claim_ttl = _run_claim_ttl_seconds()
 
     for job in jobs:
         if not job.get("enabled", True):
@@ -1844,14 +1932,43 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # this loop). mark_job_run() clears the claim on completion. The TTL
             # is only a safety valve: a claiming tick that DIES mid-run leaves a
             # stale claim that expires after the resolved run-claim TTL
-            # (_oneshot_run_claim_ttl_seconds, derived from HERMES_CRON_TIMEOUT),
-            # so the job is re-dispatched rather than wedged forever.
+            # (_run_claim_ttl_seconds, derived from HERMES_CRON_TIMEOUT and the
+            # wall-clock runtime cap), so the job is re-dispatched rather than
+            # wedged forever.
             if kind == "once":
                 claim = {"at": now.isoformat(), "by": _machine_id()}
                 job["run_claim"] = claim
                 for rj in raw_jobs:
                     if rj["id"] == job["id"]:
                         rj["run_claim"] = claim
+                        needs_save = True
+                        break
+
+            # Durable running marker for RECURRING jobs (T2, finding 2): a
+            # cron/interval job that fires and then dies mid-run (gateway
+            # killed, OOM, crash) previously left no trace in jobs.json until
+            # mark_job_run() ran — last_run_at stayed null and the run was
+            # invisible even though it may have run for hours. Stamp a
+            # SEPARATE running_marker (NOT run_claim) at fire time, plus
+            # last_status="running", so the in-flight run is durably visible.
+            #
+            # Deliberately NOT reusing run_claim: run_claim's due-skip
+            # semantics above (kind == "once" branch, top of this loop) exist
+            # to prevent double-dispatch of a one-shot. A recurring job must
+            # NEVER be skipped because it carries a marker — only made
+            # visible — so running_marker carries no such skip guard anywhere.
+            # mark_job_run() clears the marker (and overwrites last_status)
+            # on completion; a marker left behind by a dead tick is stale
+            # visibility only, recovered by T3's startup reconciliation
+            # rather than any due-skip logic here.
+            if kind in {"cron", "interval"}:
+                marker = {"at": now.isoformat(), "by": _machine_id()}
+                job["running_marker"] = marker
+                job["last_status"] = "running"
+                for rj in raw_jobs:
+                    if rj["id"] == job["id"]:
+                        rj["running_marker"] = marker
+                        rj["last_status"] = "running"
                         needs_save = True
                         break
 

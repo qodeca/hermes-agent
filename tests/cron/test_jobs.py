@@ -1000,8 +1000,8 @@ class TestGetDueJobs:
         once the run_claim is older than the TTL it is re-dispatched (recovered)."""
         # Pin the inactivity timeout unset so the derived TTL is deterministic.
         monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
-        from cron.jobs import _hermes_now, _oneshot_run_claim_ttl_seconds
-        ttl = _oneshot_run_claim_ttl_seconds()
+        from cron.jobs import _hermes_now, _run_claim_ttl_seconds
+        ttl = _run_claim_ttl_seconds()
         t0 = _hermes_now()
         run_at = (t0 - timedelta(seconds=5)).isoformat()
         save_jobs([{
@@ -1025,11 +1025,14 @@ class TestGetDueJobs:
     def test_run_claim_ttl_derived_from_cron_timeout(self, tmp_cron_dir, monkeypatch):
         """The stale-recovery TTL tracks HERMES_CRON_TIMEOUT (3x headroom), with
         the fixed constant as a floor, and falls back to the constant when runs
-        are unbounded (timeout=0)."""
+        are unbounded (timeout=0). Pins HERMES_CRON_MAX_RUNTIME=0 (unlimited) so
+        only the inactivity axis is exercised here — the wall-clock axis added
+        in T2 has its own dedicated coverage in test_run_claim_recurring.py."""
         from cron.jobs import (
-            _oneshot_run_claim_ttl_seconds as ttl,
+            _run_claim_ttl_seconds as ttl,
             ONESHOT_RUN_CLAIM_TTL_SECONDS as FLOOR,
         )
+        monkeypatch.setenv("HERMES_CRON_MAX_RUNTIME", "0")
         # Unset → default 600s inactivity → 1800s (== the historical constant).
         monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
         assert ttl() == 1800.0
