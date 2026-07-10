@@ -13,6 +13,11 @@ Covers:
       suppressed (returns False, nothing sent); a different title still
       sends; after the window elapses (patched clock) the same title sends
       again;
+  (b2) concurrency: two threads racing on the same title send exactly once —
+      the check-then-act on the suppression dict is atomic under
+      ``_rate_limit_lock`` (deterministic: a barrier inside the patched
+      ``_monotonic`` clock parks both threads right before the guarded
+      section, so without the lock both would pass the check);
   (c) unconfigured (``alerts.deliver`` unset/empty) -> False, no raise,
       no delivery attempted;
   (d) delivery raising -> False, no raise, one warning logged;
@@ -48,9 +53,13 @@ def _reset_rate_limit_state():
 
 @pytest.fixture
 def configured(monkeypatch):
-    """Patch config so alerts.deliver resolves to a concrete telegram target."""
+    """Patch config so alerts.deliver resolves to a concrete telegram target.
+
+    Patches load_config_readonly — the module only reads one key, so it uses
+    the deepcopy-free read path, not load_config().
+    """
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"alerts": {"deliver": "telegram:123456"}},
     )
 
@@ -153,11 +162,91 @@ class TestRateLimiting:
         assert patched_send.call_count == 2
 
 
+class TestConcurrentSuppression:
+    """(b2) the check-then-act on the suppression dict is atomic: two threads
+    racing on the same title send exactly once."""
+
+    def test_two_threads_same_title_send_exactly_once(self, configured, monkeypatch):
+        """Deterministic race, not a shotgun: the suppression dict is
+        replaced with a subclass whose ``get`` READS the value first and
+        THEN parks on a 2-party barrier before returning it — freezing each
+        thread between the check and the act, the exact window the lock
+        closes. (The barrier must sit AFTER the read: a barrier before the
+        read only synchronizes entry, and the GIL then serializes
+        read-after-write anyway — verified: that variant did NOT fail with
+        the lock neutralized.) WITHOUT the lock, both threads read the
+        missing title, rendezvous at the barrier, and both dispatch — this
+        test then fails with dispatch_calls == 2, reliably (verified by
+        temporarily neutralizing the lock: 3/3 failing runs). WITH the
+        lock, the second thread is parked at the lock and never reaches the
+        barrier, so the winner's wait times out (~0.5s, breaking the
+        barrier), it proceeds alone, and the loser then sees the winner's
+        timestamp and is suppressed. No sleep tuning — the interleaving is
+        forced, not hoped for."""
+        import threading
+
+        from hermes_cli import operator_alerts
+
+        barrier = threading.Barrier(2)
+
+        class _BarrierDict(dict):
+            """dict whose .get rendezvouses AFTER reading (see above)."""
+
+            def get(self, key, default=None):
+                value = super().get(key, default)
+                try:
+                    barrier.wait(timeout=0.5)
+                except threading.BrokenBarrierError:
+                    pass  # guarded path: only one thread ever gets here at a time
+                return value
+
+        monkeypatch.setattr(operator_alerts, "_last_sent_at", _BarrierDict())
+
+        dispatch_calls = []
+        monkeypatch.setattr(
+            operator_alerts,
+            "_dispatch",
+            lambda target, message: dispatch_calls.append(message) or True,
+        )
+        monkeypatch.setattr(
+            operator_alerts,
+            "_resolve_target",
+            lambda deliver_value: {"platform": "telegram", "chat_id": "123456", "thread_id": None},
+        )
+
+        results = []
+
+        def worker():
+            results.append(operator_alerts.send_operator_alert("Racy title", "body"))
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(dispatch_calls) == 1, (
+            f"expected exactly one dispatch for concurrent identical titles, "
+            f"got {len(dispatch_calls)}"
+        )
+        assert sorted(results) == [False, True]
+
+    def test_rate_limit_lock_exists_and_is_a_lock(self):
+        """Belt-and-braces presence check so an accidental removal of the
+        lock (or replacing it with something non-context-manager) fails a
+        cheap unit test even if the race test above were ever skipped."""
+        import threading
+
+        from hermes_cli import operator_alerts
+
+        assert isinstance(operator_alerts._rate_limit_lock, type(threading.Lock()))
+
+
 class TestUnconfigured:
     """(c) unconfigured -> False, no raise, nothing dispatched."""
 
     def test_empty_deliver_returns_false_without_dispatch(self, monkeypatch, patched_send):
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"alerts": {"deliver": ""}})
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"alerts": {"deliver": ""}})
         from hermes_cli.operator_alerts import send_operator_alert
 
         result = send_operator_alert("Should not send", "body")
@@ -166,7 +255,7 @@ class TestUnconfigured:
         patched_send.assert_not_called()
 
     def test_missing_alerts_block_returns_false_without_dispatch(self, monkeypatch, patched_send):
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
         from hermes_cli.operator_alerts import send_operator_alert
 
         result = send_operator_alert("Should not send")
@@ -175,7 +264,7 @@ class TestUnconfigured:
         patched_send.assert_not_called()
 
     def test_deliver_local_returns_false_without_dispatch(self, monkeypatch, patched_send):
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"alerts": {"deliver": "local"}})
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"alerts": {"deliver": "local"}})
         from hermes_cli.operator_alerts import send_operator_alert
 
         result = send_operator_alert("Should not send")

@@ -26,6 +26,7 @@ module ever landing.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Dict, Optional
 
@@ -43,6 +44,12 @@ _monotonic = time.monotonic
 # process restarting is itself alert-worthy context, not noise).
 _RATE_LIMIT_SECONDS = 15 * 60
 _last_sent_at: Dict[str, float] = {}
+# Guards the check-then-act on _last_sent_at: without it, two threads raising
+# the same title concurrently (e.g. parallel cron jobs failing the same way)
+# could both pass the rate-limit check and double-send. Held ONLY across the
+# bookkeeping (get + set) — never across the dispatch, so a slow platform
+# call cannot serialize other alerts behind it.
+_rate_limit_lock = threading.Lock()
 
 
 def send_operator_alert(title: str, body: str = "", *, severity: str = "warning") -> bool:
@@ -72,10 +79,12 @@ def send_operator_alert(title: str, body: str = "", *, severity: str = "warning"
 
 
 def _send_operator_alert_impl(title: str, body: str, *, severity: str) -> bool:
-    from hermes_cli.config import load_config
+    # Read-only access to one key — skip load_config()'s defensive deepcopy
+    # (this path may run inside the cron reconciliation loop at startup).
+    from hermes_cli.config import load_config_readonly
 
     try:
-        cfg = load_config() or {}
+        cfg = load_config_readonly() or {}
     except Exception as e:
         logger.warning("operator alert skipped: failed to load config: %s", e)
         return False
@@ -84,16 +93,22 @@ def _send_operator_alert_impl(title: str, body: str, *, severity: str) -> bool:
     if not deliver_value or deliver_value == "local":
         return False  # unconfigured: silent no-op by design (default state)
 
+    # Clock read stays OUTSIDE the lock (tests synchronize threads on it to
+    # deterministically force the former race); the check-then-act on the
+    # suppression dict is atomic under the lock. Only the bookkeeping is
+    # guarded — dispatch happens after release, so a slow platform send
+    # never serializes concurrent alerts with different titles.
     now = _monotonic()
-    last = _last_sent_at.get(title)
-    if last is not None and (now - last) < _RATE_LIMIT_SECONDS:
-        logger.debug("operator alert suppressed (rate-limited within 15 min): %s", title)
-        return False
-    # Record the attempt before dispatch (not gated on success) so a
-    # persistently-failing delivery channel can't be hammered every call —
-    # the same alert storm this rate limit exists to stop would otherwise
-    # just turn into a storm of failed delivery attempts instead.
-    _last_sent_at[title] = now
+    with _rate_limit_lock:
+        last = _last_sent_at.get(title)
+        if last is not None and (now - last) < _RATE_LIMIT_SECONDS:
+            logger.debug("operator alert suppressed (rate-limited within 15 min): %s", title)
+            return False
+        # Record the attempt before dispatch (not gated on success) so a
+        # persistently-failing delivery channel can't be hammered every call —
+        # the same alert storm this rate limit exists to stop would otherwise
+        # just turn into a storm of failed delivery attempts instead.
+        _last_sent_at[title] = now
 
     message = f"⚠️ [{severity}] {title}"
     if body:
