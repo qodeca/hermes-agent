@@ -61,6 +61,10 @@ from hermes_cli.colors import Colors, color
 
 logger = logging.getLogger(__name__)
 
+# Module-level flag to guard atexit hook registration (ensures it runs only once
+# even if run_gateway is called multiple times in the same process).
+_atexit_hook_registered = False
+
 # =============================================================================
 # Process Management (for manual gateway runs)
 # =============================================================================
@@ -4838,7 +4842,10 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     def _atexit_hook() -> None:
         _exit_diag("atexit.hook", sys_exc=repr(sys.exc_info()))
 
-    _atexit.register(_atexit_hook)
+    global _atexit_hook_registered
+    if not _atexit_hook_registered:
+        _atexit.register(_atexit_hook)
+        _atexit_hook_registered = True
 
     success = False
     try:
