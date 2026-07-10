@@ -417,10 +417,10 @@ class GatewaySlashCommandsMixin:
         So this handler requires an explicit ``allow_admin_from`` entry
         (``policy.enabled and policy.is_admin(...)``) rather than trusting
         the "gating disabled -> admin" fallback. Operators who haven't
-        configured ``allow_admin_from`` can still read the report from a
-        trusted shell via ``hermes gateway allowlist show`` (or the
-        interactive CLI's ``/allowlist show``) — that surface is local to
-        the machine running the gateway, not reachable by a remote chat user.
+        configured ``allow_admin_from`` can still read the report by running
+        ``/allowlist show`` in an interactive ``hermes`` CLI session on the
+        machine running the gateway — that surface is local, not reachable
+        by a remote chat user.
         """
         from gateway.authz_mixin import format_allowlist_report
         from gateway.slash_access import policy_for_source as _policy_for_source
@@ -432,8 +432,8 @@ class GatewaySlashCommandsMixin:
             return (
                 "⛔ /allowlist show is admin-only. Add your user ID to "
                 "allow_admin_from for this platform/scope to run it from "
-                "chat, or run `hermes gateway allowlist show` at a trusted "
-                "shell on the machine running the gateway."
+                "chat, or run `/allowlist show` in an interactive hermes CLI "
+                "session on the machine running the gateway."
             )
 
         args = event.get_command_args().strip().lower() if event else ""
