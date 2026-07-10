@@ -540,9 +540,14 @@ def reconcile_orphaned_runs() -> list:
 
         marker = job.get("running_marker")
         if marker and _stamp_is_reapable(marker, now, ttl_seconds, own_machine_id):
-            mark_job_run(job_id, False, _RECONCILE_ERROR)
-            _send_reconcile_alert(job_id, job_name, _RECONCILE_ERROR)
-            reconciled.append(job_id)
+            # Per-job guard (mirrors mark_running_jobs_interrupted): one
+            # malformed job dict must not abort reconciliation of the rest.
+            try:
+                mark_job_run(job_id, False, _RECONCILE_ERROR)
+                _send_reconcile_alert(job_id, job_name, _RECONCILE_ERROR)
+                reconciled.append(job_id)
+            except Exception as e:
+                logger.warning("Failed to reconcile orphaned job %s: %s", job_id, e)
             continue  # a job carries at most one of the two markers
 
         claim = job.get("run_claim")
@@ -555,9 +560,12 @@ def reconcile_orphaned_runs() -> list:
             times = repeat.get("times")
             completed = repeat.get("completed", 0)
             if times is not None and times > 0 and completed >= times:
-                mark_job_run(job_id, False, _RECONCILE_ERROR)
-                _send_reconcile_alert(job_id, job_name, _RECONCILE_ERROR)
-                reconciled.append(job_id)
+                try:
+                    mark_job_run(job_id, False, _RECONCILE_ERROR)
+                    _send_reconcile_alert(job_id, job_name, _RECONCILE_ERROR)
+                    reconciled.append(job_id)
+                except Exception as e:
+                    logger.warning("Failed to reconcile orphaned job %s: %s", job_id, e)
             # else: retry budget remains — leave for get_due_jobs()' own
             # stale-claim recovery at the next tick (see docstring above).
 

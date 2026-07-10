@@ -288,6 +288,20 @@ class TestReconcileCalledOnceBeforeFirstTick:
         ):
             assert InProcessCronScheduler().reconcile() is None
 
+    @pytest.mark.parametrize("exc", [SystemExit(1), KeyboardInterrupt()])
+    def test_inprocess_reconcile_swallows_baseexception(self, exc):
+        """BaseException too, mirroring the tick loop's guard (#32612): once
+        T16's alert delivery lands, a SystemExit from a misbehaving provider
+        SDK reached via _send_reconcile_alert must not escape reconcile() and
+        prevent the ticker from ever starting. KeyboardInterrupt is swallowed
+        for the same reason as in the tick loop — shutdown is driven by
+        stop_event (set by the main thread's signal handler), not by
+        exceptions in this daemon thread."""
+        from cron.scheduler_provider import InProcessCronScheduler
+
+        with patch("cron.scheduler.reconcile_orphaned_runs", side_effect=exc):
+            assert InProcessCronScheduler().reconcile() is None
+
 
 class TestGuardedOperatorAlert:
     """(g): the T16 guarded-import alert pattern."""
@@ -397,3 +411,50 @@ class TestMultipleJobsReconciledInOnePass:
         assert j.get_job("fresh_foreign_recurring")["running_marker"] is not None
         assert j.get_job("retryable_oneshot")["run_claim"] is not None
         assert j.get_job("exhausted_oneshot") is None
+
+    def test_per_job_failure_does_not_abort_remaining_jobs(self, tmp_cron_dir, monkeypatch, caplog):
+        """One malformed job dict must not abort reconciliation of the rest —
+        mark_job_run is wrapped per-job (mirrors mark_running_jobs_interrupted):
+        the first job's mark_job_run raises, the second is still reconciled."""
+        now = j._hermes_now()
+        stale_at = (now - timedelta(hours=3)).isoformat()
+        j.save_jobs([
+            _recurring_job(
+                job_id="poisoned",
+                running_marker={"at": stale_at, "by": "otherhost:1"},
+                last_status="running",
+            ),
+            _recurring_job(
+                job_id="healthy",
+                running_marker={"at": stale_at, "by": "otherhost:2"},
+                last_status="running",
+                next_run_at=(now - timedelta(seconds=5)).isoformat(),
+            ),
+        ])
+
+        real_mark_job_run = s.mark_job_run
+
+        def _mark(job_id, success, error=None, **kw):
+            if job_id == "poisoned":
+                raise RuntimeError("malformed job dict")
+            return real_mark_job_run(job_id, success, error, **kw)
+
+        monkeypatch.setattr(s, "mark_job_run", _mark)
+
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            reconciled = s.reconcile_orphaned_runs()
+
+        assert reconciled == ["healthy"], (
+            "the second job must still be reconciled after the first one's "
+            "mark_job_run raised"
+        )
+        after = j.get_job("healthy")
+        assert after["running_marker"] is None
+        assert after["last_status"] == "error"
+        # The poisoned job's state is untouched (its mark_job_run raised)...
+        assert j.get_job("poisoned")["running_marker"] is not None
+        # ...and the failure was logged, not swallowed silently.
+        assert any(
+            "Failed to reconcile orphaned job poisoned" in rec.message
+            for rec in caplog.records
+        )

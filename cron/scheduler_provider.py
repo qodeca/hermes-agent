@@ -180,7 +180,14 @@ class InProcessCronScheduler(CronScheduler):
         try:
             from cron.scheduler import reconcile_orphaned_runs
             reconcile_orphaned_runs()
-        except Exception as e:
+        except BaseException as e:
+            # Catch BaseException (not just Exception) for the same reason the
+            # tick loop below does: a SystemExit from a misbehaving provider
+            # SDK reached via alert delivery (T16's send_operator_alert) must
+            # not prevent the ticker from ever starting (#32612 precedent).
+            # KeyboardInterrupt is intentionally caught here too — shutdown is
+            # driven by stop_event (set by the main thread's signal handler),
+            # not by an exception in this daemon thread.
             logger.error("Startup cron reconciliation failed: %s", e, exc_info=True)
         return None
 
