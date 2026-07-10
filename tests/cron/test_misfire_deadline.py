@@ -229,7 +229,11 @@ class TestCreateJobValidation:
 
     def test_none_is_accepted_and_preserves_default_behavior(self, tmp_cron_dir):
         job = j.create_job(prompt="x", schedule="every 1h", misfire_deadline_seconds=None)
-        assert job["misfire_deadline_seconds"] is None
+        # None (the default) is not persisted at all — same convention as
+        # attach_to_session — so the key is absent, and readers fall back to
+        # None via .get("misfire_deadline_seconds").
+        assert "misfire_deadline_seconds" not in job
+        assert job.get("misfire_deadline_seconds") is None
 
     def test_positive_int_is_persisted(self, tmp_cron_dir):
         job = j.create_job(prompt="x", schedule="every 1h", misfire_deadline_seconds=120)

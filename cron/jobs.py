@@ -596,7 +596,17 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             # wall-clock intent — and converted one-shots have no
             # self-healing (the kind=="cron" DST repair path never sees them).
             now_naive = now.replace(tzinfo=None)
-            next_naive = croniter(schedule, now_naive).get_next(datetime)
+            try:
+                next_naive = croniter(schedule, now_naive).get_next(datetime)
+            except Exception as e:
+                # An impossible date-pinned expression (e.g. "0 2 30 2 *" —
+                # Feb 30 never occurs) passes the syntax-only validation
+                # above (no base time to search) but blows up here once
+                # croniter actually tries to find an occurrence, raising
+                # CroniterBadDateError. Surface the same friendly ValueError
+                # as the validation two lines above instead of letting it
+                # propagate raw.
+                raise ValueError(f"Invalid cron expression '{schedule}': {e}")
             # Naive-to-naive comparison keeps the ≤window check on the same
             # (wall-clock) convention as the computation above.
             if next_naive - now_naive <= timedelta(days=NEAR_TERM_ONE_SHOT_WINDOW_DAYS):
@@ -1314,13 +1324,16 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
-        "misfire_deadline_seconds": misfire_deadline_seconds,
     }
-    # Only persist attach_to_session when explicitly set, so existing jobs and
-    # the common case stay byte-identical (absent key => fall back to the
-    # global cron.mirror_delivery config, default off).
+    # Only persist attach_to_session/misfire_deadline_seconds when explicitly
+    # set, so existing jobs and the common case stay byte-identical (absent
+    # key => fall back to the default: attach_to_session falls back to the
+    # global cron.mirror_delivery config, default off; misfire_deadline_seconds
+    # readers treat a missing key the same as None via .get()).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if misfire_deadline_seconds is not None:
+        job["misfire_deadline_seconds"] = misfire_deadline_seconds
 
     with _jobs_lock():
         jobs = load_jobs()

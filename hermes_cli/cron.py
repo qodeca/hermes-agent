@@ -166,7 +166,16 @@ def cron_list(show_all: bool = False):
 
         # Execution history
         last_status = job.get("last_status")
-        if last_status:
+        if last_status == "skipped_stale":
+            # A skipped-stale slot never ran: `last_run_at` (if present at
+            # all) is left over from a PRIOR real run, so pairing it with
+            # this status would misleadingly imply the skip happened at that
+            # old timestamp. Report it on its own line instead, with the
+            # skip notice (which already states the missed time) as the
+            # explanation.
+            status_display = color("skipped (stale)", Colors.YELLOW)
+            print(f"    Last:      {status_display}: {job.get('last_error', '?')}")
+        elif last_status:
             last_run = job.get("last_run_at", "?")
             if last_status == "ok":
                 status_display = color("ok", Colors.GREEN)

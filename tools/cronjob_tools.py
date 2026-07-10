@@ -1104,7 +1104,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "misfire_deadline_seconds": {
                 "type": "integer",
-                "description": "Optional, recurring jobs only (schedules like '0 9 * * *' or 'every 2h' — ignored for one-shots). Skip the run instead of firing late when it misses its scheduled slot by more than this many seconds (e.g. after a gateway outage) — measured from the slot itself, independent of the internal catch-up grace window. Positive integer. Omit to keep the default: a stale run still fires once, just late. On update, pass 0 to clear."
+                "description": "Optional, recurring jobs only (schedules like '0 9 * * *' or 'every 2h' — ignored for one-shots). Skip the run instead of firing late when it misses its scheduled slot by more than this many seconds (e.g. after a gateway outage) — measured from the slot itself, independent of the internal catch-up grace window. Positive integer. Omit to keep the default: a stale run still fires once, just late. On update, pass 0 to clear. This deadline is enforced by the built-in scheduler's catch-up scan (get_due_jobs); runs fired externally (e.g. by a custom cron provider's webhook) are not gated by it."
             },
         },
         "required": ["action"]

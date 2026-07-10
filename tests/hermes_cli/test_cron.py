@@ -154,6 +154,27 @@ class TestCronCommandLifecycle:
         out = capsys.readouterr().out
         assert "Deliver:   local" in out
 
+    def test_list_shows_dedicated_skipped_stale_line(self, tmp_cron_dir, capsys):
+        """A job whose most recent slot was skipped as stale
+        (``last_status == "skipped_stale"``) must render on its own
+        'Last:' line with the skip notice, not paired with a stale
+        ``last_run_at`` under the generic 'Last run:' label — that would
+        misleadingly imply the skip happened at that old timestamp."""
+        from cron.jobs import load_jobs, save_jobs
+
+        create_job(prompt="Daily digest", schedule="0 9 * * *")
+        jobs = load_jobs()
+        jobs[0]["last_run_at"] = "2026-06-01T09:00:00+00:00"
+        jobs[0]["last_status"] = "skipped_stale"
+        jobs[0]["last_error"] = "Cron 'Daily digest' skipped a stale run: ..."
+        save_jobs(jobs)
+
+        cron_command(Namespace(cron_command="list", all=True))
+
+        out = capsys.readouterr().out
+        assert "Last:      skipped (stale): Cron 'Daily digest' skipped a stale run" in out
+        assert "Last run:" not in out
+
 
 class TestGatewayNotRunningWarning:
     """`cron create` / `cron list` must warn when the gateway (and thus the

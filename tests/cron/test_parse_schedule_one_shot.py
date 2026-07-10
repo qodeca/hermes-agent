@@ -181,6 +181,23 @@ class TestNearTermDatePinnedConversion:
         assert result["expr"] == "0 2 10 7 * 30"
 
 
+class TestImpossibleDatePinnedExpression:
+    """An impossible date-pinned expression (day-of-month that never occurs
+    in the given month, e.g. Feb 30) passes the syntax-only validation
+    earlier in parse_schedule (no base time to search against) but blows up
+    croniter's get_next() search here with CroniterBadDateError. That must
+    surface as the same friendly ValueError the syntax validation raises,
+    not propagate raw."""
+
+    def test_impossible_date_raises_friendly_value_error(self, monkeypatch):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 7, 9, 10, 0, 0, tzinfo=CONFIGURED_TZ)
+        monkeypatch.setattr("cron.jobs._hermes_now", _fixed_now(now))
+
+        with pytest.raises(ValueError, match="Invalid cron expression"):
+            parse_schedule("0 2 30 2 *")
+
+
 class TestIsDatePinnedCronExpr:
     """Unit tests for the structural detection helper."""
 
