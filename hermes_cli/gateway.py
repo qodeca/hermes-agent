@@ -266,8 +266,8 @@ def _ancestor_pids(max_depth: int = _RESTART_GUARD_MAX_ANCESTRY_DEPTH) -> list[i
 
 def _invoked_from_within_gateway() -> bool:
     """Detect whether this CLI invocation is running inside the gateway's own
-    process tree — the condition the ``gateway restart`` self-targeting
-    guard refuses on.
+    process tree — the condition the ``gateway restart`` and ``gateway
+    stop`` self-targeting guards refuse on.
 
     Primary signal: the ``_HERMES_GATEWAY=1`` env var the gateway sets on
     itself and its children. A child context that strips env vars before
@@ -6849,8 +6849,12 @@ def _gateway_command_inner(args):
 
     elif subcmd == "stop":
         # Defense: refuse self-targeting gateway stop from inside the gateway.
-        # Prevents agent-initiated kill loops when combined with supervisor KeepAlive.
-        if os.getenv("_HERMES_GATEWAY") == "1":
+        # Prevents agent-initiated kill loops when combined with supervisor
+        # KeepAlive. Checks both the _HERMES_GATEWAY=1 env marker and process
+        # ancestry against the recorded gateway PID — a child context that
+        # strips env vars would otherwise defeat an env-only check. Same
+        # guard as `gateway restart` below (_invoked_from_within_gateway).
+        if _invoked_from_within_gateway():
             print_error(
                 "Refusing to stop the gateway from inside the gateway process.\n"
                 "This command was blocked to prevent restart loops.\n"

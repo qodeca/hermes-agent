@@ -395,15 +395,46 @@ class GatewaySlashCommandsMixin:
     async def _handle_allowlist_command(self, event: MessageEvent) -> str:
         """Handle /allowlist show — print the effective authorization sources.
 
-        Finding #29: the owner himself was denied after a restart and had no
-        way to answer "why was I denied?" without reading code. Prints the
-        same env allowlists / allow-all flags / pairing grants that
+        The owner himself was denied after a restart and had no way to
+        answer "why was I denied?" without reading code. Prints the same env
+        allowlists / allow-all flags / pairing grants that
         ``GatewayAuthorizationMixin._is_user_authorized`` actually consults —
         see ``gateway.authz_mixin.format_allowlist_report`` for the shared
         source of truth (kept in one place so this command can't drift from
         what actually gates access).
+
+        Admin-gated, unconditionally: the report enumerates every
+        allowlisted/paired user id, which is itself sensitive (an attacker
+        who reaches this command learns exactly who else to impersonate or
+        target). Ordinary slash commands fall back to "everyone allowed to
+        talk to the bot may run this" whenever the operator hasn't opted
+        into ``allow_admin_from`` gating for the scope (see
+        ``SlashAccessPolicy.is_admin`` — ``enabled=False`` returns
+        ``is_admin() == True`` for backward compatibility). That default is
+        wrong for THIS command: with gating off (the default), any user
+        admitted by an active per-platform allow-all is otherwise "allowed
+        to talk to the bot" and would be able to enumerate the allowlist.
+        So this handler requires an explicit ``allow_admin_from`` entry
+        (``policy.enabled and policy.is_admin(...)``) rather than trusting
+        the "gating disabled -> admin" fallback. Operators who haven't
+        configured ``allow_admin_from`` can still read the report from a
+        trusted shell via ``hermes gateway allowlist show`` (or the
+        interactive CLI's ``/allowlist show``) — that surface is local to
+        the machine running the gateway, not reachable by a remote chat user.
         """
         from gateway.authz_mixin import format_allowlist_report
+        from gateway.slash_access import policy_for_source as _policy_for_source
+
+        source = event.source if event else None
+        policy = _policy_for_source(self.config, source)
+        user_id = getattr(source, "user_id", None) if source else None
+        if not (policy.enabled and policy.is_admin(user_id)):
+            return (
+                "⛔ /allowlist show is admin-only. Add your user ID to "
+                "allow_admin_from for this platform/scope to run it from "
+                "chat, or run `hermes gateway allowlist show` at a trusted "
+                "shell on the machine running the gateway."
+            )
 
         args = event.get_command_args().strip().lower() if event else ""
         if args != "show":

@@ -1,9 +1,9 @@
-"""Tests for the gateway restart/stop self-targeting guard hardening (finding 26).
+"""Tests for the gateway restart/stop self-targeting guard hardening.
 
 The guard used to be a bare ``os.getenv("_HERMES_GATEWAY") == "1"`` check. If
 that env var is stripped in a child context (e.g. a sandboxed terminal-tool
 backend), the guard fails open and an agent-reachable `hermes gateway
-restart` can self-kill loop against a KeepAlive supervisor.
+restart` (or `stop`) can self-kill loop against a KeepAlive supervisor.
 
 ``_invoked_from_within_gateway()`` adds a second, independent signal: walk
 this process's parent-PID ancestry and compare against the PID recorded in
@@ -12,8 +12,10 @@ this process's parent-PID ancestry and compare against the PID recorded in
 ``gateway.status.get_running_pid`` and ``hermes_cli.gateway._ancestor_pids``,
 are monkeypatched rather than driving real OS process trees or file locks —
 both underlying primitives already have their own dedicated test coverage in
-``tests/gateway/test_status.py``) and confirm ``hermes gateway restart``
-wires the result into the refuse/allow decision end-to-end.
+``tests/gateway/test_status.py``) and confirm ``hermes gateway restart`` and
+``hermes gateway stop`` both wire the result into the refuse/allow decision
+end-to-end — `stop` used to only check the bare env var, so it's covered
+here the same way `restart` is.
 """
 
 from argparse import Namespace
@@ -27,6 +29,10 @@ class _Reached(Exception):
 
 def _restart_args() -> Namespace:
     return Namespace(gateway_command="restart", all=False, system=False)
+
+
+def _stop_args() -> Namespace:
+    return Namespace(gateway_command="stop", all=False, system=False)
 
 
 def _run_restart_expect_refused(monkeypatch):
@@ -52,6 +58,32 @@ def _run_restart_expect_allowed(monkeypatch):
     monkeypatch.setattr(gw, "_dispatch_all_via_service_manager_if_s6", _sentinel)
     with pytest.raises(_Reached):
         gw.gateway_command(_restart_args())
+
+
+def _run_stop_expect_refused(monkeypatch):
+    import hermes_cli.gateway as gw
+
+    with pytest.raises(SystemExit) as exc_info:
+        gw.gateway_command(_stop_args())
+    assert exc_info.value.code == 1
+
+
+def _run_stop_expect_allowed(monkeypatch):
+    """Assert the ``stop`` guard does not fire — control reaches past it.
+
+    Mirrors ``_run_restart_expect_allowed``: short-circuits the first
+    downstream call with a sentinel so the test doesn't drive real service
+    dispatch / process killing.
+    """
+    import hermes_cli.gateway as gw
+
+    def _sentinel(*a, **k):
+        raise _Reached()
+
+    monkeypatch.setattr(gw, "_dispatch_via_service_manager_if_s6", _sentinel)
+    monkeypatch.setattr(gw, "_dispatch_all_via_service_manager_if_s6", _sentinel)
+    with pytest.raises(_Reached):
+        gw.gateway_command(_stop_args())
 
 
 class TestInvokedFromWithinGatewayHelper:
@@ -209,3 +241,31 @@ class TestGatewayRestartGuardIntegration:
             "gateway.status.get_running_pid", lambda *a, **k: None
         )
         _run_restart_expect_allowed(monkeypatch)
+
+
+class TestGatewayStopGuardIntegration:
+    """End-to-end through ``hermes gateway stop`` — mirrors
+    ``TestGatewayRestartGuardIntegration`` above. ``stop`` used to guard
+    with a bare env-var check only; it now shares
+    ``_invoked_from_within_gateway()`` with ``restart``."""
+
+    def test_stop_refuses_inside_gateway_env_only(self, monkeypatch):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        _run_stop_expect_refused(monkeypatch)
+
+    def test_stop_refuses_via_ancestry_when_env_stripped(self, monkeypatch):
+        import hermes_cli.gateway as gw
+
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid", lambda *a, **k: 4242
+        )
+        monkeypatch.setattr(gw, "_ancestor_pids", lambda: [111, 4242])
+        _run_stop_expect_refused(monkeypatch)
+
+    def test_stop_allows_outside_gateway(self, monkeypatch):
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid", lambda *a, **k: None
+        )
+        _run_stop_expect_allowed(monkeypatch)
