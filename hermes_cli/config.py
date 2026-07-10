@@ -2690,6 +2690,16 @@ DEFAULT_CONFIG = {
         # the per-turn token budget. 0 or negative disables capping.
         # Default 262144 (256 KiB).
         "output_max_bytes": 262144,
+        # Wall-clock runtime cap for a single job run, independent of the
+        # inactivity timeout (HERMES_CRON_TIMEOUT, default 600s) — which
+        # resets on every API/tool/stream event and so does not bound a
+        # job that stays *active* against a failing backend (e.g. retrying
+        # a slow/hanging call in a loop; finding 3 — an overnight job ran
+        # 2.4+ hours this way). Overridable via HERMES_CRON_MAX_RUNTIME env
+        # var, which takes precedence over this config value. 0 or negative
+        # disables the cap (unlimited — the inactivity timeout is then the
+        # only bound). Default 3600 (1 hour).
+        "max_runtime_seconds": 3600,
     },
 
     # Kanban multi-agent coordination — controls the dispatcher loop that

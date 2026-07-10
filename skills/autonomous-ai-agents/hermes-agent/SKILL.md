@@ -734,11 +734,14 @@ the `cronjob` tool, the `hermes cron` CLI (`list`, `add`, `edit`,
   job), `context_from` (chain job A's output into job B), `workdir`
   (run in a specific dir with its `AGENTS.md` / `CLAUDE.md` loaded),
   multi-platform delivery.
-- **Invariants:** 3-minute hard interrupt per run, `.tick.lock` file
-  prevents duplicate ticks across processes, cron sessions pass
-  `skip_memory=True` by default, and cron deliveries are framed with a
-  header/footer instead of being mirrored into the target gateway
-  session (keeps role alternation intact).
+- **Invariants:** inactivity timeout (`HERMES_CRON_TIMEOUT`, default
+  600s, resets on activity) plus a wall-clock runtime cap
+  (`HERMES_CRON_MAX_RUNTIME` / `cron.max_runtime_seconds`, default
+  3600s, bounds total runtime regardless of activity — both `0` =
+  unlimited), `.tick.lock` file prevents duplicate ticks across
+  processes, cron sessions pass `skip_memory=True` by default, and cron
+  deliveries are framed with a header/footer instead of being mirrored
+  into the target gateway session (keeps role alternation intact).
 
 User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/cron
 

@@ -88,7 +88,7 @@ Tools are auto-discovered — add a file under `tools/` that calls `registry.reg
 
 **Skills**: `skills/` (bundled, active by default) vs `optional-skills/` (heavy/niche, installed via `hermes skills install`). SKILL.md `description` must be ≤ 60 chars, one sentence, ending with a period.
 
-**Cron** (`cron/jobs.py` + `cron/scheduler.py`): natural-language scheduled jobs with multi-platform delivery; agents schedule via the `cronjob` tool, users via `hermes cron`. Cron sessions have a 3-minute hard interrupt.
+**Cron** (`cron/jobs.py` + `cron/scheduler.py`): natural-language scheduled jobs with multi-platform delivery; agents schedule via the `cronjob` tool, users via `hermes cron`. Cron sessions are bounded by an inactivity timeout (`HERMES_CRON_TIMEOUT`, default 600s, resets on activity) plus a wall-clock runtime cap (`HERMES_CRON_MAX_RUNTIME` / `cron.max_runtime_seconds`, default 3600s, bounds total runtime regardless of activity).
 
 **Config vs secrets:** behavioral settings live in `~/.hermes/config.yaml`. `~/.hermes/.env` is for credentials only — do **not** add `HERMES_*` env vars for non-secret config. Logs: `~/.hermes/logs/` (`agent.log`, `errors.log`, `gateway.log`); browse with `hermes logs`.
 

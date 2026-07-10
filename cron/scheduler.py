@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -2480,6 +2481,55 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+_DEFAULT_CRON_MAX_RUNTIME = 3600.0  # seconds (1 hour)
+
+
+def _resolve_cron_max_runtime(cfg: dict | None) -> float | None:
+    """Resolve the cron wall-clock runtime cap: env > config > default.
+
+    Unlike the inactivity timeout (HERMES_CRON_TIMEOUT, reset by every
+    API/tool/stream event), this bounds the TOTAL wall-clock runtime of a
+    single job run regardless of activity — the only backstop for a job
+    that stays "active" (e.g. retrying a slow/hanging backend call in a
+    loop) without ever going idle long enough to trip the inactivity path.
+
+    Resolution order: HERMES_CRON_MAX_RUNTIME env > cron.max_runtime_seconds
+    config > 3600s default. 0 (from either source) means unlimited — the
+    inactivity timeout is then the only bound. Mirrors the
+    HERMES_CRON_TIMEOUT env-parsing convention: an invalid (non-numeric)
+    value logs a warning and falls back to the hardcoded default rather
+    than raising.
+
+    Returns None for "unlimited", else the limit in seconds.
+    """
+    _raw = os.getenv("HERMES_CRON_MAX_RUNTIME", "").strip()
+    if _raw:
+        try:
+            _val = float(_raw)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_MAX_RUNTIME=%r; using default %.0fs",
+                _raw, _DEFAULT_CRON_MAX_RUNTIME,
+            )
+            _val = _DEFAULT_CRON_MAX_RUNTIME
+        return _val if _val > 0 else None
+
+    _cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    _cron_cfg = _cron_cfg if isinstance(_cron_cfg, dict) else {}
+    _configured = _cron_cfg.get("max_runtime_seconds")
+    if _configured is None:
+        return _DEFAULT_CRON_MAX_RUNTIME
+    try:
+        _val = float(_configured)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid cron.max_runtime_seconds=%r in config; using default %.0fs",
+            _configured, _DEFAULT_CRON_MAX_RUNTIME,
+        )
+        _val = _DEFAULT_CRON_MAX_RUNTIME
+    return _val if _val > 0 else None
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -3095,16 +3145,29 @@ def run_job(
         else:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+
+        # Wall-clock cap: bounds the TOTAL runtime of a single job run
+        # regardless of activity. The inactivity timeout above resets on
+        # every tool call / API call / stream token, so a job that stays
+        # *active* against a failing backend (e.g. retrying a slow/hanging
+        # call in a loop) can run unbounded — this is the backstop.
+        # HERMES_CRON_MAX_RUNTIME env > cron.max_runtime_seconds config >
+        # 3600s default. 0 = unlimited (matches HERMES_CRON_TIMEOUT).
+        _cron_max_runtime = _resolve_cron_max_runtime(_cfg)
+        _cron_runtime_limit = _cron_max_runtime
+
         _POLL_INTERVAL = 5.0
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
-        # thread used for inactivity timeout monitoring.
+        # thread used for inactivity/wall-clock timeout monitoring.
         _cron_context = contextvars.copy_context()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        _run_started = time.monotonic()
         _inactivity_timeout = False
+        _runtime_timeout = False
         try:
-            if _cron_inactivity_limit is None:
+            if _cron_inactivity_limit is None and _cron_runtime_limit is None:
                 # Unlimited — just wait for the result.
                 result = _cron_future.result()
             else:
@@ -3116,17 +3179,24 @@ def run_job(
                     if done:
                         result = _cron_future.result()
                         break
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
-                        break
+                    # Agent still running — check the wall-clock cap first
+                    # (cheap, no agent call needed), then inactivity.
+                    if _cron_runtime_limit is not None:
+                        _elapsed = time.monotonic() - _run_started
+                        if _elapsed >= _cron_runtime_limit:
+                            _runtime_timeout = True
+                            break
+                    if _cron_inactivity_limit is not None:
+                        _idle_secs = 0.0
+                        if hasattr(agent, "get_activity_summary"):
+                            try:
+                                _act = agent.get_activity_summary()
+                                _idle_secs = _act.get("seconds_since_activity", 0.0)
+                            except Exception:
+                                pass
+                        if _idle_secs >= _cron_inactivity_limit:
+                            _inactivity_timeout = True
+                            break
         except Exception:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
             raise
@@ -3159,6 +3229,43 @@ def run_job(
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
+                f"— last activity: {_last_desc}"
+            )
+
+        if _runtime_timeout:
+            # Build diagnostic summary from the agent's activity tracker —
+            # the job WAS active (that's why inactivity didn't trip), so
+            # this tells the operator what it was doing when the wall-clock
+            # cap ran out.
+            _activity = {}
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    _activity = agent.get_activity_summary()
+                except Exception:
+                    pass
+            _last_desc = _activity.get("last_activity_desc", "unknown")
+            _cur_tool = _activity.get("current_tool")
+            _iter_n = _activity.get("api_call_count", 0)
+            _iter_max = _activity.get("max_iterations", 0)
+            _elapsed_secs = time.monotonic() - _run_started
+
+            logger.error(
+                "Job '%s' hit wall-clock runtime cap after %.0fs (limit %.0fs) "
+                "| last_activity=%s | iteration=%s/%s | tool=%s",
+                job_name, _elapsed_secs, _cron_runtime_limit,
+                _last_desc, _iter_n, _iter_max,
+                _cur_tool or "none",
+            )
+            if hasattr(agent, "interrupt"):
+                agent.interrupt("Cron job timed out (wall-clock runtime cap)")
+            # _runtime_timeout is only set True inside the branch guarded by
+            # `_cron_runtime_limit is not None` above, but that narrowing
+            # doesn't survive past the try/finally — assert it back for the
+            # type checker (and as a defensive invariant check).
+            assert _cron_runtime_limit is not None
+            raise TimeoutError(
+                f"Cron job '{job_name}' exceeded wall-clock runtime cap of "
+                f"{int(_cron_runtime_limit)}s (ran {int(_elapsed_secs)}s) "
                 f"— last activity: {_last_desc}"
             )
 
