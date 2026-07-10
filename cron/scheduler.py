@@ -51,6 +51,14 @@ logger = logging.getLogger(__name__)
 # be filtered/greppable independent of the rest of cron.scheduler's logging.
 _run_summary_logger = logging.getLogger("cron.run_summary")
 
+# Substring used to classify agent-abort exceptions as exit_reason
+# "interrupted" in run_job's stats bucketing. Every relevant raise site
+# carries it: agent.interrupt() messages ("Cron job timed out (...)" go
+# through TimeoutError first), turn_exit_reason="interrupted_during_api_call"
+# re-raised as RuntimeError, and the gateway-shutdown "Interrupted by gateway
+# shutdown ..." error. Keep those messages in sync if reworded.
+_INTERRUPT_EXIT_SUBSTRING = "interrupt"
+
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
@@ -245,6 +253,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 from cron.jobs import (
     get_due_jobs,
     mark_job_run,
+    build_minimal_run_stats,
     save_job_output,
     advance_next_run,
     claim_dispatch,
@@ -413,7 +422,15 @@ def mark_running_jobs_interrupted(reason: str) -> list:
     marked = []
     for job_id in job_ids:
         try:
-            mark_job_run(job_id, False, reason)
+            # Explicit minimal stats record: without it, a previous run's
+            # last_run_stats (e.g. exit_reason "completed") would be left
+            # standing next to the fresh last_status="error" written here.
+            # Only the job id is in hand on this shutdown path — no job
+            # record lookup, so started_at is unknowable (None).
+            mark_job_run(
+                job_id, False, reason,
+                stats=build_minimal_run_stats("interrupted"),
+            )
             marked.append(job_id)
         except Exception as e:
             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
@@ -611,8 +628,14 @@ def reconcile_orphaned_runs() -> list:
         if marker and _stamp_is_reapable(marker, now, ttl_seconds, own_machine_id):
             # Per-job guard (mirrors mark_running_jobs_interrupted): one
             # malformed job dict must not abort reconciliation of the rest.
+            # Minimal stats keep last_run_stats describing THIS outcome
+            # (started_at recovered from the marker stamp) instead of a
+            # stale prior run's record.
             try:
-                mark_job_run(job_id, False, _RECONCILE_ERROR)
+                mark_job_run(
+                    job_id, False, _RECONCILE_ERROR,
+                    stats=build_minimal_run_stats("reconciled", job=job),
+                )
                 _send_reconcile_alert(job_id, job_name, _RECONCILE_ERROR)
                 reconciled.append(job_id)
             except Exception as e:
@@ -630,7 +653,10 @@ def reconcile_orphaned_runs() -> list:
             completed = repeat.get("completed", 0)
             if times is not None and times > 0 and completed >= times:
                 try:
-                    mark_job_run(job_id, False, _RECONCILE_ERROR)
+                    mark_job_run(
+                        job_id, False, _RECONCILE_ERROR,
+                        stats=build_minimal_run_stats("reconciled", job=job),
+                    )
                     _send_reconcile_alert(job_id, job_name, _RECONCILE_ERROR)
                     reconciled.append(job_id)
                 except Exception as e:
@@ -3598,7 +3624,7 @@ def run_job(
                 _stats_exit_reason = "timeout_wall_clock"
             else:
                 _stats_exit_reason = "timeout"
-        elif "interrupt" in str(e).lower():
+        elif _INTERRUPT_EXIT_SUBSTRING in str(e).lower():
             _stats_exit_reason = "interrupted"
         else:
             _stats_exit_reason = "error"
@@ -3676,10 +3702,26 @@ def run_job(
                     _stats_activity = {}
             if not isinstance(_stats_activity, dict):
                 _stats_activity = {}
+            _stats_ended = _hermes_now()
+            _stats_exec_duration = round(time.monotonic() - _stats_start_monotonic, 3)
+            # Clock convention (documented on mark_job_run): duration_s is
+            # the wall-clock span ended_at - started_at, so it stays
+            # consistent with the two timestamps even when started_at is the
+            # fire-time running_marker stamp — which predates pool queueing
+            # and can exceed actual execution time. exec_duration_s is the
+            # monotonic execution-only measure from the top of run_job.
+            try:
+                _stats_started_dt = _ensure_aware(datetime.fromisoformat(_stats_started_at))
+                _stats_wall_duration = round((_stats_ended - _stats_started_dt).total_seconds(), 3)
+            except (ValueError, TypeError):
+                # Unparseable marker stamp — fall back to the execution
+                # measure rather than dropping the field.
+                _stats_wall_duration = _stats_exec_duration
             agent._cron_run_stats = {
                 "started_at": _stats_started_at,
-                "ended_at": _hermes_now().isoformat(),
-                "duration_s": round(time.monotonic() - _stats_start_monotonic, 3),
+                "ended_at": _stats_ended.isoformat(),
+                "duration_s": _stats_wall_duration,
+                "exec_duration_s": _stats_exec_duration,
                 "api_calls": _stats_activity.get("api_call_count", 0),
                 "output_tokens": getattr(agent, "session_output_tokens", 0) or 0,
                 "exit_reason": _stats_exit_reason,
@@ -3903,8 +3945,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
+        # Known narrow gap: a path that raises between run_job returning and
+        # the summary emission above (e.g. save_job_output failing) lands
+        # here and skips the cron.run_summary line for that run — the
+        # minimal stats record below still captures the outcome.
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
+            # Explicit minimal stats so last_run_stats reflects THIS failed
+            # processing attempt, not a stale prior run's record.
+            mark_job_run(
+                job["id"], False, str(e),
+                stats=build_minimal_run_stats("error", job=job),
+            )
         return False
 
 

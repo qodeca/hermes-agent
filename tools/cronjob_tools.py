@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
+    build_minimal_run_stats,
     claim_job_for_fire,
     create_job,
     get_job,
@@ -651,7 +652,12 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
         try:
-            mark_job_run(job_id, False, str(e))
+            # Explicit minimal stats so last_run_stats reflects THIS failed
+            # fire, not a stale prior run's record (see mark_job_run docs).
+            mark_job_run(
+                job_id, False, str(e),
+                stats=build_minimal_run_stats("error", job=job),
+            )
         except Exception:
             pass
         return {"claimed": True, "success": False, "error": str(e)}

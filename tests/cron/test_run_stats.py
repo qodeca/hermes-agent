@@ -23,15 +23,27 @@ all (unchanged behavior).
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cron.jobs import create_job, get_job, mark_job_run
+from cron.jobs import build_minimal_run_stats, create_job, get_job, mark_job_run
 from cron.scheduler import run_job
 
-STATS_KEYS = {"started_at", "ended_at", "duration_s", "api_calls", "output_tokens", "exit_reason"}
+STATS_KEYS = {
+    "started_at", "ended_at", "duration_s", "exec_duration_s",
+    "api_calls", "output_tokens", "exit_reason",
+}
+
+
+def _wall_span_seconds(stats: dict) -> float:
+    """Wall-clock span ended_at - started_at from the stats' own timestamps."""
+    started = datetime.fromisoformat(stats["started_at"])
+    ended = datetime.fromisoformat(stats["ended_at"])
+    return (ended - started).total_seconds()
+
 
 _RUNTIME_PROVIDER = {
     "api_key": "test-key",
@@ -100,7 +112,7 @@ def _run_job(job, tmp_path, agent_cls):
 class TestRunJobStats:
     """run_job attaches a complete stats dict to the (deferred) agent."""
 
-    def test_successful_run_has_all_six_keys_with_plausible_values(self, tmp_path):
+    def test_successful_run_has_all_keys_with_plausible_values(self, tmp_path):
         job = {"id": "job-a", "name": "job a", "prompt": "hello"}
         (success, output, final_response, error), deferred = _run_job(job, tmp_path, _FakeAgentSuccess)
 
@@ -111,11 +123,15 @@ class TestRunJobStats:
 
         assert set(stats) == STATS_KEYS
         assert stats["duration_s"] > 0
+        assert stats["exec_duration_s"] > 0
         assert stats["api_calls"] == 7
         assert stats["output_tokens"] == 4321
         assert stats["exit_reason"] == "completed"
         assert stats["started_at"]
         assert stats["ended_at"]
+        # Clock-consistency invariant: duration_s IS the wall-clock span
+        # between the two recorded timestamps.
+        assert stats["duration_s"] == pytest.approx(_wall_span_seconds(stats), abs=0.01)
 
     def test_started_at_prefers_running_marker_when_present(self, tmp_path):
         job = {
@@ -129,6 +145,28 @@ class TestRunJobStats:
         assert success is True
         assert deferred[0]._cron_run_stats["started_at"] == "2020-01-01T00:00:00+00:00"
 
+    def test_marker_anchored_duration_is_wall_clock_not_exec_time(self, tmp_path):
+        """When started_at comes from the fire-time running_marker (which
+        predates pool queueing), duration_s must be the wall-clock span
+        ended_at - started_at — NOT the monotonic execution measure, which
+        lives separately in exec_duration_s. A years-old marker makes the
+        difference unmistakable."""
+        job = {
+            "id": "job-span",
+            "name": "recurring job",
+            "prompt": "hello",
+            "running_marker": {"at": "2020-01-01T00:00:00+00:00", "by": "test"},
+        }
+        (success, *_rest), deferred = _run_job(job, tmp_path, _FakeAgentSuccess)
+        assert success is True
+        stats = deferred[0]._cron_run_stats
+
+        # duration_s ≈ ended_at - started_at (the invariant), which here is
+        # years; exec_duration_s stays the tiny actual execution time.
+        assert stats["duration_s"] == pytest.approx(_wall_span_seconds(stats), abs=0.01)
+        assert stats["duration_s"] > 365 * 24 * 3600  # marker is years in the past
+        assert stats["exec_duration_s"] < 120  # actual execution was near-instant
+
     def test_failing_run_still_records_stats_with_error_exit_reason(self, tmp_path):
         job = {"id": "job-b", "name": "job b", "prompt": "hello"}
         (success, output, final_response, error), deferred = _run_job(job, tmp_path, _FakeAgentFails)
@@ -140,6 +178,7 @@ class TestRunJobStats:
 
         assert set(stats) == STATS_KEYS
         assert stats["duration_s"] >= 0
+        assert stats["exec_duration_s"] >= 0
         assert stats["api_calls"] == 2
         assert stats["output_tokens"] == 12
         assert stats["exit_reason"] == "error"
@@ -192,30 +231,36 @@ class TestMarkJobRunStats:
             "started_at": "2026-01-01T00:00:00+00:00",
             "ended_at": "2026-01-01T00:00:05+00:00",
             "duration_s": 5.0,
+            "exec_duration_s": 4.2,
             "api_calls": 3,
             "output_tokens": 100,
             "exit_reason": "completed",
         }
         mark_job_run(job["id"], True, stats=stats)
         updated = get_job(job["id"])
+        assert updated is not None
         assert updated["last_run_stats"] == stats
 
     def test_legacy_call_without_stats_writes_no_last_run_stats_key(self, tmp_cron_dir):
         job = create_job(prompt="Test", schedule="every 1h")
         mark_job_run(job["id"], True)
         updated = get_job(job["id"])
+        assert updated is not None
         assert "last_run_stats" not in updated
 
     def test_stats_omitted_on_subsequent_call_does_not_clear_prior_value(self, tmp_cron_dir):
         """Documents current behavior: mark_job_run only ever ADDS the key
-        when stats is given; it never explicitly clears a stale one. Not
-        exercised by any real caller today (run_one_job always passes
-        run_stats, even when None), but pin the behavior so it's a deliberate
-        choice if it ever changes."""
+        when stats is given; it never explicitly clears a stale one. The
+        outcome-recording callers (shutdown interrupt, reconcile, processing
+        errors) therefore pass build_minimal_run_stats(...) explicitly — see
+        TestStaleStatsReplaced — so the only omitting caller left is
+        run_one_job's success path for stats-less runs (no_agent jobs), where
+        a surviving previous record is the correct behavior to pin."""
         job = create_job(prompt="Test", schedule="every 1h")
         mark_job_run(job["id"], True, stats={"exit_reason": "completed"})
         mark_job_run(job["id"], True)  # legacy-style call, no stats kwarg
         updated = get_job(job["id"])
+        assert updated is not None
         assert updated["last_run_stats"] == {"exit_reason": "completed"}
 
 
@@ -257,6 +302,7 @@ class TestRunOneJobStatsThreading:
             "started_at": "2026-07-10T00:00:00+00:00",
             "ended_at": "2026-07-10T00:00:05+00:00",
             "duration_s": 5.0,
+            "exec_duration_s": 4.8,
             "api_calls": 3,
             "output_tokens": 456,
             "exit_reason": "completed",
@@ -269,6 +315,7 @@ class TestRunOneJobStatsThreading:
 
         assert result is True
         updated = get_job(job["id"])
+        assert updated is not None
         assert updated["last_run_stats"] == stats
         assert updated["last_status"] == "ok"
 
@@ -289,6 +336,7 @@ class TestRunOneJobStatsThreading:
             "started_at": "2026-07-10T00:00:00+00:00",
             "ended_at": "2026-07-10T00:00:02+00:00",
             "duration_s": 2.0,
+            "exec_duration_s": 1.9,
             "api_calls": 1,
             "output_tokens": 20,
             "exit_reason": "error",
@@ -303,6 +351,7 @@ class TestRunOneJobStatsThreading:
 
         assert result is True  # run_one_job "succeeds" at processing even though the job itself failed
         updated = get_job(job["id"])
+        assert updated is not None
         assert updated["last_status"] == "error"
         assert updated["last_run_stats"] == stats
 
@@ -315,6 +364,7 @@ class TestRunOneJobStatsThreading:
             "started_at": "2026-07-10T00:00:00+00:00",
             "ended_at": "2026-07-10T00:00:03+00:00",
             "duration_s": 3.0,
+            "exec_duration_s": 2.7,
             "api_calls": 5,
             "output_tokens": 78,
             "exit_reason": "completed",
@@ -333,6 +383,7 @@ class TestRunOneJobStatsThreading:
 
         # Delivery failure is tracked but does not block persistence of stats.
         updated = get_job(job["id"])
+        assert updated is not None
         assert updated["last_run_stats"] == stats
         assert updated["last_delivery_error"] == "delivery platform is down"
 
@@ -352,4 +403,114 @@ class TestRunOneJobStatsThreading:
 
         assert result is True
         updated = get_job(job["id"])
+        assert updated is not None
         assert "last_run_stats" not in updated
+
+
+class TestBuildMinimalRunStats:
+    """build_minimal_run_stats: explicit outcome record for paths without an
+    executed agent run (shutdown interrupt, reconcile, processing errors)."""
+
+    def test_shape_and_null_unknowables_without_job(self):
+        stats = build_minimal_run_stats("interrupted")
+        assert set(stats) == STATS_KEYS
+        assert stats["exit_reason"] == "interrupted"
+        assert stats["ended_at"]
+        assert stats["started_at"] is None
+        assert stats["duration_s"] is None
+        assert stats["exec_duration_s"] is None
+        assert stats["api_calls"] is None
+        assert stats["output_tokens"] is None
+
+    def test_started_at_recovered_from_running_marker(self):
+        job = {"running_marker": {"at": "2020-01-01T00:00:00+00:00", "by": "test"}}
+        stats = build_minimal_run_stats("reconciled", job=job)
+        assert stats["started_at"] == "2020-01-01T00:00:00+00:00"
+        # Clock-consistency invariant holds here too: duration_s is the
+        # wall-clock span between the record's own timestamps.
+        assert stats["duration_s"] == pytest.approx(_wall_span_seconds(stats), abs=0.01)
+        assert stats["exec_duration_s"] is None  # the run never executed here
+
+    def test_started_at_recovered_from_one_shot_run_claim(self):
+        job = {"run_claim": {"at": "2020-06-01T00:00:00+00:00", "by": "test"}}
+        stats = build_minimal_run_stats("reconciled", job=job)
+        assert stats["started_at"] == "2020-06-01T00:00:00+00:00"
+        assert stats["duration_s"] is not None
+
+    def test_unparseable_marker_yields_null_duration(self):
+        job = {"running_marker": {"at": "not-a-timestamp", "by": "test"}}
+        stats = build_minimal_run_stats("reconciled", job=job)
+        assert stats["started_at"] == "not-a-timestamp"
+        assert stats["duration_s"] is None
+
+
+class TestStaleStatsReplaced:
+    """Cross-call scenarios: a later interrupt/reconcile outcome must replace
+    a previous successful run's last_run_stats, never leave exit_reason
+    "completed" standing next to a fresh last_status "error"."""
+
+    _COMPLETED_STATS = {
+        "started_at": "2026-07-09T22:00:00+00:00",
+        "ended_at": "2026-07-09T22:00:30+00:00",
+        "duration_s": 30.0,
+        "exec_duration_s": 29.5,
+        "api_calls": 4,
+        "output_tokens": 250,
+        "exit_reason": "completed",
+    }
+
+    def test_shutdown_interrupt_replaces_completed_stats(self, tmp_cron_dir):
+        import cron.scheduler as s
+
+        job = create_job(prompt="Test", schedule="every 1h")
+        mark_job_run(job["id"], True, stats=dict(self._COMPLETED_STATS))
+        before = get_job(job["id"])
+        assert before is not None
+        assert before["last_run_stats"]["exit_reason"] == "completed"
+
+        # Simulate the gateway shutdown path: the job is in flight when the
+        # process force-kills tool subprocesses.
+        with s._running_lock:
+            s._running_job_ids.add(job["id"])
+        try:
+            marked = s.mark_running_jobs_interrupted("Interrupted by gateway shutdown")
+        finally:
+            with s._running_lock:
+                s._running_job_ids.discard(job["id"])
+                s._interrupted_job_ids.discard(job["id"])
+
+        assert job["id"] in marked
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["last_status"] == "error"
+        assert updated["last_run_stats"]["exit_reason"] == "interrupted"
+        assert updated["last_run_stats"]["ended_at"]
+
+    def test_reconcile_replaces_completed_stats(self, tmp_cron_dir, monkeypatch):
+        import cron.scheduler as s
+        from cron.jobs import _machine_id, load_jobs, save_jobs
+
+        job = create_job(prompt="Test", schedule="every 1h")
+        mark_job_run(job["id"], True, stats=dict(self._COMPLETED_STATS))
+
+        # Stamp a running_marker as if a previous incarnation of this host
+        # died mid-run (own host prefix => reapable at startup regardless of
+        # marker age).
+        marker_at = "2026-07-09T23:00:00+00:00"
+        jobs = load_jobs()
+        for j in jobs:
+            if j["id"] == job["id"]:
+                j["running_marker"] = {"at": marker_at, "by": _machine_id()}
+        save_jobs(jobs)
+
+        monkeypatch.setattr(s, "_send_reconcile_alert", lambda *a, **kw: None)
+        reconciled = s.reconcile_orphaned_runs()
+
+        assert job["id"] in reconciled
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["last_status"] == "error"
+        assert updated["last_run_stats"]["exit_reason"] == "reconciled"
+        # started_at recovered from the orphaned run's own marker stamp.
+        assert updated["last_run_stats"]["started_at"] == marker_at
+        assert updated["running_marker"] is None  # marker cleared by mark_job_run

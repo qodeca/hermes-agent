@@ -110,7 +110,7 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
     marks = []
     monkeypatch.setattr(
         s, "mark_job_run",
-        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok)),
+        lambda jid, ok, err=None, delivery_error=None, stats=None: marks.append((jid, ok)),
     )
 
     ok = s.run_one_job({"id": "j6", "name": "t"})

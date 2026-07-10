@@ -1587,6 +1587,51 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
+def build_minimal_run_stats(
+    exit_reason: str, job: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Build a per-run stats dict for outcomes recorded OUTSIDE ``run_job``.
+
+    The shutdown-interrupt, orphan-reconcile, and processing-error paths
+    call ``mark_job_run()`` without an executed (or finished) agent run in
+    hand, so the execution fields are unknowable. Writing this explicit
+    minimal record — instead of omitting ``stats`` — keeps
+    ``last_run_stats`` describing THIS outcome: otherwise a previous
+    successful run's ``exit_reason: "completed"`` would be left standing
+    next to a fresh ``last_status: "error"`` and mislead the operator.
+
+    ``started_at`` is recovered from the job's durable fire-time stamp
+    (recurring ``running_marker`` or one-shot ``run_claim``) when the
+    caller has the job record — an orphaned run really did start at that
+    stamp — and ``duration_s`` is then the wall-clock span to now,
+    matching the convention documented on ``mark_job_run``. Every field
+    that cannot be known is an explicit ``None``.
+    """
+    started_at = None
+    if job:
+        started_at = (
+            (job.get("running_marker") or {}).get("at")
+            or (job.get("run_claim") or {}).get("at")
+        )
+    ended = _hermes_now()
+    duration_s = None
+    if started_at:
+        try:
+            started_dt = _ensure_aware(datetime.fromisoformat(started_at))
+            duration_s = round((ended - started_dt).total_seconds(), 3)
+        except (ValueError, TypeError):
+            duration_s = None
+    return {
+        "started_at": started_at,
+        "ended_at": ended.isoformat(),
+        "duration_s": duration_s,
+        "exec_duration_s": None,
+        "api_calls": None,
+        "output_tokens": None,
+        "exit_reason": exit_reason,
+    }
+
+
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                  delivery_error: Optional[str] = None,
                  stats: Optional[dict] = None):
@@ -1600,10 +1645,21 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     can succeed (agent produced output) but fail delivery (platform down).
 
     ``stats``: optional per-run stats dict (finding 14 / T6) —
-    ``{"started_at", "ended_at", "duration_s", "api_calls", "output_tokens",
-    "exit_reason"}`` — persisted verbatim as ``job["last_run_stats"]``.
+    ``{"started_at", "ended_at", "duration_s", "exec_duration_s",
+    "api_calls", "output_tokens", "exit_reason"}`` — persisted verbatim as
+    ``job["last_run_stats"]``. Clock convention: ``duration_s`` is the
+    wall-clock span ``ended_at - started_at`` (the three fields always
+    agree, even when ``started_at`` is the fire-time ``running_marker``
+    stamp that predates pool queueing); ``exec_duration_s`` is the
+    monotonic, execution-only measure taken inside ``run_job`` (``None``
+    when the run never executed).
     ``None`` (the default) writes no ``last_run_stats`` key at all, so
-    existing callers that don't pass it are unaffected. Caveat: a one-shot
+    existing callers that don't pass it are unaffected — outcome-recording
+    callers that lack execution data (shutdown interrupt, orphan
+    reconciliation, processing errors) should pass
+    ``build_minimal_run_stats(...)`` rather than omit stats, so a stale
+    previous run's record (e.g. ``exit_reason: "completed"``) is not left
+    standing next to a fresh ``last_status: "error"``. Caveat: a one-shot
     job that hits its repeat limit on this run is popped from the jobs list
     a few lines below (before the final ``save_jobs``) — stats computed for
     that terminal run are accepted but never persisted, since the record
