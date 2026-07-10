@@ -1502,6 +1502,20 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # Circuit breaker for repeated backend failures: abort the turn after
+    # this many consecutive failed API calls.  Unlike api_max_retries above
+    # (which is reset by fallback activation, credential rotation, and
+    # transport recovery), this counts across all those resets — it is the
+    # backstop against a deterministically failing backend keeping a
+    # session in a retry/fallback/compress loop indefinitely.  0 disables.
+    try:
+        _raw_breaker = _agent_section.get("max_consecutive_api_failures", 10)
+        _breaker_limit = int(_raw_breaker)
+        _breaker_limit = max(_breaker_limit, 0)  # negative → disabled
+    except (TypeError, ValueError):
+        _breaker_limit = 10
+    agent._max_consecutive_api_failures = _breaker_limit
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)

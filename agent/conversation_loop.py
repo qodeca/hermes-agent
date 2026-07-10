@@ -612,6 +612,15 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    # Circuit breaker: consecutive failed API calls for this turn.  This
+    # counter deliberately lives OUTSIDE the retry/fallback reset machinery
+    # below — ``retry_count`` and ``compression_attempts`` are zeroed at
+    # every fallback activation, credential rotation, and primary-transport
+    # recovery, so none of them can bound the *total* number of failures a
+    # turn is allowed to burn.  Only a successful API response resets this
+    # one.  Threshold comes from config ``agent.max_consecutive_api_failures``
+    # (0 = disabled).
+    consecutive_api_failures = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
@@ -2253,6 +2262,9 @@ def run_conversation(
                         )
                 
                 _retry.has_retried_429 = False  # Reset on success
+                # A successful API response closes the failure streak — the
+                # circuit breaker only trips on UNBROKEN runs of failures.
+                consecutive_api_failures = 0
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
                 # usable content. Empty responses still loop through the
@@ -2596,6 +2608,58 @@ def run_conversation(
                     retryable=classified.retryable,
                     reason=classified.reason.value,
                 )
+
+                # ── Consecutive-failure circuit breaker ───────────────────
+                # Counted here — before any recovery branch — so every failed
+                # API call adds to the streak no matter which recovery path
+                # (credential rotation, fallback activation, transport
+                # recovery, compression restart) subsequently resets
+                # ``retry_count``.  Without this backstop a deterministically
+                # failing backend can keep a turn alive indefinitely: each
+                # reset re-arms the per-cycle retry budget (observed
+                # real-world: 1,832 identical 400s over ~2 h).  On trip, exit
+                # through the same terminal shape as the other hard-failure
+                # returns (``failed=True``) so downstream consumers — cron
+                # raises on ``failed=True`` and marks the run failed — see a
+                # clean abort, with no synthetic user message appended and
+                # message-role alternation preserved.
+                consecutive_api_failures += 1
+                _breaker_limit = getattr(
+                    agent, "_max_consecutive_api_failures", 10
+                )
+                if _breaker_limit > 0 and consecutive_api_failures >= _breaker_limit:
+                    agent._flush_status_buffer()
+                    _breaker_summary = agent._summarize_api_error(api_error)
+                    _breaker_response = (
+                        f"model backend failing repeatedly "
+                        f"({classified.reason.value}); aborting after "
+                        f"{consecutive_api_failures} consecutive failed API "
+                        f"calls. Last error: {_breaker_summary}"
+                    )
+                    agent._emit_status(f"❌ {_breaker_response}")
+                    agent._vprint(
+                        f"{agent.log_prefix}❌ Circuit breaker: "
+                        f"{consecutive_api_failures} consecutive API failures "
+                        f"(limit {_breaker_limit}) — aborting turn.",
+                        force=True,
+                    )
+                    logger.error(
+                        "%sCircuit breaker tripped after %s consecutive API "
+                        "failures (reason=%s, limit=%s): %s",
+                        agent.log_prefix, consecutive_api_failures,
+                        classified.reason.value, _breaker_limit,
+                        _breaker_summary,
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _breaker_response,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _breaker_response,
+                        "failure_reason": classified.reason.value,
+                    }
 
                 if (
                     classified.reason == FailoverReason.billing

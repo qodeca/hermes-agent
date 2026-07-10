@@ -1004,6 +1004,14 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Circuit breaker: abort the turn after this many CONSECUTIVE failed
+        # API calls, counted across provider fallbacks and retry-counter
+        # resets (fallback activation, credential rotation, and transport
+        # recovery all reset the per-cycle retry counter, so a
+        # deterministically failing backend can otherwise keep a session
+        # spinning for hours).  The counter resets to 0 on any successful
+        # API response.  0 = disabled.
+        "max_consecutive_api_failures": 10,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
