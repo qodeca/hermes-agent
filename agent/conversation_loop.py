@@ -4928,7 +4928,25 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
-                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+                # Skip while a same-session compression-failure cooldown is
+                # active — mirrors the pre-API pressure check above and the
+                # turn-prologue preflight (turn_context.py). Without this
+                # pre-check, this site re-enters compress() every turn during
+                # the cooldown window; the summary attempt is suppressed by
+                # the compressor's own cooldown early-return, but a plain
+                # (non-abort-flagged) prior failure then falls straight
+                # through to another lossy static-drop cycle (T10).
+                _post_response_compression_cooldown = getattr(
+                    _compressor, "get_active_compression_failure_cooldown", lambda: None
+                )()
+                if _post_response_compression_cooldown and agent.compression_enabled:
+                    logger.info(
+                        "Skipping post-response compression: same-session cooldown "
+                        "active (~%s seconds remaining, session %s)",
+                        int(_post_response_compression_cooldown.get("remaining_seconds", 0.0)),
+                        agent.session_id or "none",
+                    )
+                elif agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,

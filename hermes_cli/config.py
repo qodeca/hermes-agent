@@ -1606,15 +1606,19 @@ DEFAULT_CONFIG = {
             "extra_body": {},
         },
         # Independent-summarizer escape hatch (T10): setting provider/model
-        # here to a DIFFERENT backend than the main model means a main-model
-        # outage (rate limit, capacity/overload, timeout) never takes context
-        # compression down with it — the summary call goes to a healthy
-        # endpoint instead of retrying the one that's already failing. When
+        # here to a DIFFERENT backend than the main model keeps compression
+        # summaries working when the main model's summary calls fail with
+        # rate-limit/timeout-class errors — the summary goes to a healthy
+        # endpoint instead of the one that's already struggling. Scope note:
+        # capacity/overload-class backend faults do NOT route through this
+        # setting — the compressor classifies the summary call's own failure
+        # and aborts compression outright (messages preserved unchanged)
+        # rather than attempting any endpoint; see
+        # ContextCompressor._generate_summary's backend-fault handling. When
         # left at the "auto"/"" defaults, compression summarises using the
         # main model/endpoint, so a sustained main-model fault also blocks
-        # compression (by design — see
-        # ContextCompressor.compress()'s trigger_reason handling, which
-        # aborts rather than lossily dropping context in that case).
+        # compression until it recovers (by design — an abort beats a lossy
+        # context drop).
         "compression": {
             "provider": "auto",
             "model": "",

@@ -371,6 +371,95 @@ def test_backend_capacity_gets_one_fallback_attempt(agent_env):
     assert len(handler.captured_requests) == 2
 
 
+def _count_compress_calls(agent):
+    """Replace ``agent._compress_context`` with a counting no-op stub.
+
+    Returns the counter dict. The stub returns the messages unchanged plus a
+    fixed prompt string, so the surrounding loop sees "no progress" and moves
+    on rather than recursing.
+    """
+    calls = {"n": 0}
+
+    def _fake_compress(messages, system_message, **kwargs):
+        calls["n"] += 1
+        return messages, "stub system prompt"
+
+    agent._compress_context = _fake_compress
+    return calls
+
+
+def _arm_post_response_site_only(agent):
+    """Make ONLY the post-response threshold site's should_compress fire.
+
+    ``should_compress`` is forced True, while
+    ``should_defer_preflight_to_real_usage`` is forced True as well: the
+    turn-prologue preflight (turn_context.py) and the pre-API pressure check
+    (conversation_loop.py) both consult the defer guard first and skip
+    compression when it returns True — the post-response site consults
+    neither the defer guard nor (pre-T10-fix) the cooldown, so it is the
+    only site left armed.
+    """
+    compressor = agent.context_compressor
+    compressor.should_compress = lambda *a, **kw: True
+    compressor.should_defer_preflight_to_real_usage = lambda *a, **kw: True
+    return compressor
+
+
+def test_post_response_compression_respects_active_cooldown(agent_env):
+    """T10 fix 2 (reuses this file's mock-provider harness): the
+    post-response threshold compression site must honor an active
+    same-session compression-failure cooldown, like the pre-API pressure
+    check and the turn-prologue preflight already do. Without the pre-check
+    it re-enters compress() every turn during the cooldown window and a
+    prior plain summary failure falls through to another lossy drop cycle."""
+    import time as _time
+
+    agent, handler = agent_env
+    # Turn 1: a real tool call (read_file on a nonexistent path → error
+    # result fed back) so tool execution completes and the tool-loop tail —
+    # where the post-response compression check lives — actually runs;
+    # turn 2: final text response ends the conversation. (An unknown tool
+    # name would take the invalid-tool-call retry branch, which skips the
+    # tail.)
+    handler.response_queue = [
+        _tc_resp("read_file", '{"file_path": "/nonexistent_hermes_t10"}'),
+        _text_resp("DONE"),
+    ]
+    handler.default_response = _text_resp("DONE")
+
+    compressor = _arm_post_response_site_only(agent)
+    # Active same-session cooldown from a prior summary failure.
+    compressor._summary_failure_cooldown_until = _time.monotonic() + 300
+    compressor._last_summary_error = "prior summary failure"
+
+    calls = _count_compress_calls(agent)
+    result = agent.run_conversation("hello", conversation_history=[], task_id="t")
+
+    assert result.get("failed") is not True
+    # The post-response site must NOT attempt compression during the cooldown.
+    assert calls["n"] == 0
+
+
+def test_post_response_compression_runs_without_cooldown(agent_env):
+    """Control for the cooldown test above: with NO active cooldown, the
+    identically-armed post-response site DOES attempt compression — proving
+    the zero-call assertion detects suppression, not a dead site."""
+    agent, handler = agent_env
+    handler.response_queue = [
+        _tc_resp("read_file", '{"file_path": "/nonexistent_hermes_t10"}'),
+        _text_resp("DONE"),
+    ]
+    handler.default_response = _text_resp("DONE")
+
+    _arm_post_response_site_only(agent)
+
+    calls = _count_compress_calls(agent)
+    result = agent.run_conversation("hello", conversation_history=[], task_id="t")
+
+    assert result.get("failed") is not True
+    assert calls["n"] >= 1
+
+
 def test_breaker_threshold_config_default():
     """The knob is wired from config with a sane default (10)."""
     test_home = tempfile.mkdtemp(prefix="hermes_breaker_cfg_")

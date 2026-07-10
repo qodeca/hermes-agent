@@ -1325,6 +1325,156 @@ class TestBackendFaultTriggerReason:
         assert "summary via aux model" in result
 
 
+class TestSummaryFailureBackendFaultClassification:
+    """T10 (the REAL residual path): threshold-triggered compression runs
+    during a backend outage, the summary call itself hits the same sick
+    endpoint and fails with a capacity/overload error. Previously that was
+    treated as generic-transient → lossy static-drop. Now the summary call's
+    OWN failure is classified (via agent.error_classifier); backend faults
+    abort-preserve exactly like the threaded trigger_reason short-circuit.
+    """
+
+    def _msgs(self, n=10):
+        return [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            for i in range(n)
+        ]
+
+    def _compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="main-model",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
+    @staticmethod
+    def _backend_capacity_err():
+        """A prefill_memory_exceeded-shaped 400 — the oMLX memory-guard
+        rejection from the real incident (classified backend_capacity)."""
+        err = Exception(
+            'Error code: 400 - {"error": {"code": "prefill_memory_exceeded", '
+            '"message": "prefill_memory_exceeded"}}'
+        )
+        err.status_code = 400
+        return err
+
+    def test_summary_call_backend_capacity_failure_aborts_preserving_messages(self):
+        """(a) Summary call raising a prefill_memory_exceeded-shaped error →
+        exactly one call_llm attempt (zero further), cooldown recorded,
+        messages preserved, flag set — NOT a lossy drop."""
+        c = self._compressor()  # no aux override — summary uses the main model
+        msgs = self._msgs(12)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=self._backend_capacity_err(),
+        ) as mock_call:
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert mock_call.call_count == 1  # zero further call_llm attempts
+        # Messages preserved — abort, not the lossy static-drop.
+        assert result == msgs
+        assert len(result) == len(msgs)
+        assert c._last_compress_aborted is True
+        assert c._last_summary_backend_fault is True
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+        cooldown = c.get_active_compression_failure_cooldown()
+        assert cooldown is not None
+        assert cooldown["remaining_seconds"] > 0
+
+    def test_summary_call_overloaded_failure_also_aborts(self):
+        """A 529 'Overloaded' summary failure (classified overloaded) gets
+        the same abort-preserve treatment as backend_capacity."""
+        err = Exception("Overloaded")
+        err.status_code = 529
+
+        c = self._compressor()
+        msgs = self._msgs(12)
+
+        with patch(
+            "agent.context_compressor.call_llm", side_effect=err,
+        ) as mock_call:
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert mock_call.call_count == 1
+        assert result == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_backend_fault is True
+        assert c._last_summary_fallback_used is False
+
+    def test_summary_call_generic_failure_keeps_lossy_fallback(self):
+        """(b) Regression: a generic (non-backend-fault, non-auth,
+        non-network) summary failure keeps today's behavior — deterministic
+        static fallback + middle-window drop, no abort, flag NOT set."""
+        c = self._compressor()
+        msgs = self._msgs(12)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=Exception("boom: unexpected provider hiccup"),
+        ):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert len(result) < len(msgs)  # middle window dropped (historical path)
+        assert c._last_compress_aborted is False
+        assert c._last_summary_backend_fault is False
+        assert c._last_summary_fallback_used is True
+
+    def test_aux_backend_fault_still_falls_back_to_main_when_main_healthy(self):
+        """Regression: a backend-capacity failure from a DISTINCT auxiliary
+        summary_model still gets the one-shot retry on the main model — the
+        classification abort only applies once no fallback remains (the aux
+        being sick says nothing about the main endpoint)."""
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "summary via main model"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="sick-aux-model",
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[self._backend_capacity_err(), mock_ok],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2
+        assert result is not None
+        assert "summary via main model" in result
+        assert c._last_summary_backend_fault is False  # cleared on success
+
+    def test_aux_and_main_both_backend_fault_aborts(self):
+        """When the aux fails AND the main-model retry also fails with a
+        backend fault, the tail classification fires on the retry — abort,
+        no third attempt."""
+        c_err1 = self._backend_capacity_err()
+        c_err2 = self._backend_capacity_err()
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="sick-aux-model",
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[c_err1, c_err2],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2  # aux attempt + one main retry, no more
+        assert result is None
+        assert c._last_summary_backend_fault is True
+
+
 class TestStreamingClosedFallback:
     """httpcore / httpx streaming premature-close errors must be classified the
     same as timeouts so the compressor retries on the main model instead of

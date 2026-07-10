@@ -2234,11 +2234,48 @@ This compaction should PRIORITISE preserving all information related to the focu
             # the auth-failure carve-out; independent of abort_on_summary_failure.
             if _is_streaming_closed:
                 self._last_summary_network_failure = True
+            # Classify the summary call's OWN failure. This is the REAL
+            # residual incident path (T10): a threshold-triggered compression
+            # runs during a backend outage, the summary call hits the same
+            # sick endpoint, fails with a capacity/overload error, and —
+            # treated as generic-transient — falls through to the lossy
+            # static-drop. Run the failure through the shared classifier
+            # (``agent.error_classifier``, chosen over duplicating the
+            # ``_BACKEND_CAPACITY_PATTERNS``/overloaded signatures here: it
+            # imports only stdlib, so there is no circular-import risk, and
+            # future pattern additions stay in one place). When the failure
+            # itself is a backend fault, set the same abort flag the
+            # trigger_reason short-circuit uses so ``compress()`` preserves
+            # the messages unchanged instead of dropping the middle window.
+            # We only reach this tail after any fallback-to-main retry has
+            # run or is unavailable — a distinct healthy auxiliary summary
+            # model keeps its normal fallback behavior above. Classification
+            # is best-effort: on any classifier error, keep today's
+            # generic-transient handling.
+            try:
+                from agent.error_classifier import (
+                    FailoverReason as _FailoverReason,
+                    classify_api_error as _classify_api_error,
+                )
+                _summary_failure_reason = _classify_api_error(e).reason
+                if _summary_failure_reason in (
+                    _FailoverReason.backend_capacity,
+                    _FailoverReason.overloaded,
+                ):
+                    self._last_summary_backend_fault = True
+            except Exception:  # pragma: no cover — classifier must never break compression
+                pass
             logger.warning(
                 "Failed to generate context summary: %s. "
-                "Further summary attempts paused for %d seconds.",
+                "Further summary attempts paused for %d seconds.%s",
                 e,
                 _transient_cooldown,
+                (
+                    " Failure classified as a backend fault — compression "
+                    "will abort and preserve messages unchanged."
+                    if self._last_summary_backend_fault
+                    else ""
+                ),
             )
             return None
 
