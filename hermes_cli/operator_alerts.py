@@ -93,8 +93,8 @@ def _send_operator_alert_impl(title: str, body: str, *, severity: str) -> bool:
     if not deliver_value or deliver_value == "local":
         return False  # unconfigured: silent no-op by design (default state)
 
-    # Clock read stays OUTSIDE the lock (tests synchronize threads on it to
-    # deterministically force the former race); the check-then-act on the
+    # Clock read stays OUTSIDE the lock (a marginally stale value only
+    # shortens the window by microseconds); the check-then-act on the
     # suppression dict is atomic under the lock. Only the bookkeeping is
     # guarded — dispatch happens after release, so a slow platform send
     # never serializes concurrent alerts with different titles.

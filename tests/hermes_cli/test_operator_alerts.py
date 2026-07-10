@@ -15,9 +15,10 @@ Covers:
       again;
   (b2) concurrency: two threads racing on the same title send exactly once —
       the check-then-act on the suppression dict is atomic under
-      ``_rate_limit_lock`` (deterministic: a barrier inside the patched
-      ``_monotonic`` clock parks both threads right before the guarded
-      section, so without the lock both would pass the check);
+      ``_rate_limit_lock`` (deterministic: a barrier embedded in the
+      suppression dict's ``.get`` parks a thread right after the read,
+      inside the check-then-act window, so without the lock both threads
+      would pass the check);
   (c) unconfigured (``alerts.deliver`` unset/empty) -> False, no raise,
       no delivery attempted;
   (d) delivery raising -> False, no raise, one warning logged;
