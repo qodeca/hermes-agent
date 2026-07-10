@@ -955,6 +955,15 @@ def cronjob(
                 repeat_state = dict(job.get("repeat") or {})
                 repeat_state["times"] = normalized_repeat
                 updates["repeat"] = repeat_state
+            if misfire_deadline_seconds is not None:
+                # 0 clears the field (restores the default fire-once-past-grace
+                # behavior); a positive int sets it. update_job() validates —
+                # None-after-mapping means "clear", any other non-positive/
+                # non-int value fails loudly there instead of silently
+                # degrading to never-skip.
+                updates["misfire_deadline_seconds"] = (
+                    None if misfire_deadline_seconds == 0 else misfire_deadline_seconds
+                )
             if schedule is not None:
                 parsed_schedule = parse_schedule(schedule)
                 updates["schedule"] = parsed_schedule
@@ -1095,7 +1104,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "misfire_deadline_seconds": {
                 "type": "integer",
-                "description": "Optional, recurring jobs only (schedules like '0 9 * * *' or 'every 2h' — ignored for one-shots). Skip the run instead of firing late when it misses its slot by more than this many seconds (e.g. after a gateway outage). Omit to keep the default: a stale run still fires once, just late."
+                "description": "Optional, recurring jobs only (schedules like '0 9 * * *' or 'every 2h' — ignored for one-shots). Skip the run instead of firing late when it misses its scheduled slot by more than this many seconds (e.g. after a gateway outage) — measured from the slot itself, independent of the internal catch-up grace window. Positive integer. Omit to keep the default: a stale run still fires once, just late. On update, pass 0 to clear."
             },
         },
         "required": ["action"]

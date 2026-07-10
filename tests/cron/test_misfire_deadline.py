@@ -7,12 +7,15 @@ avoid the perpetual-defer loop where a job whose runtime exceeds
 ``interval + grace`` would be skipped forever) and must not change.
 
 This adds an OPT-IN per-job override: when ``misfire_deadline_seconds`` is
-set and a recurring job's stale run is later than that many seconds past its
+set and a recurring job's run is later than that many seconds past its
 scheduled slot, the run is skipped entirely instead of fired — ``next_run_at``
 still fast-forwards (accumulated missed slots are not replayed either way),
 ``last_status`` records ``"skipped_stale"`` with a descriptive
 ``last_error``, and the scheduler's tick delivers a one-line notice so the
 user learns the run was skipped rather than wondering why nothing arrived.
+The deadline is measured from the scheduled slot itself, INDEPENDENT of the
+catch-up grace window: a deadline smaller than the grace still skips (the
+smaller window dominates).
 
 Covers:
   (a) set + very stale -> not in the due list, ``last_status ==
@@ -21,9 +24,15 @@ Covers:
   (b) unset -> still fires once past grace (#33315 regression guard,
       mandatory);
   (c) set but within the deadline -> fires normally, same as today;
-  (d) ``create_job`` validation: positive int required, ``None`` allowed;
+  (d) ``create_job`` / ``update_job`` validation: positive int required,
+      ``None`` allowed (clears on update); the ``cronjob`` tool's update
+      action sets the field and ``0`` clears it;
   (e) one-shot jobs are unaffected — the catch-up branch this modifies is
-      gated to recurring (cron/interval) jobs only.
+      gated to recurring (cron/interval) jobs only;
+  (f) deadline below the grace window: ``deadline < lateness < grace`` must
+      still skip — the deadline is not clamped to the grace;
+  (g) ``get_due_jobs()`` contract: plain list by default, ``(due, skips)``
+      with ``include_skips=True``.
 """
 from datetime import datetime, timedelta
 
@@ -45,12 +54,6 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(j, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr(j, "OUTPUT_DIR", tmp_path / "cron" / "output")
     monkeypatch.setattr(s, "_hermes_home", tmp_path)
-    # This whole file runs in one subprocess (scripts/run_tests.sh spawns one
-    # subprocess per FILE, not per test), so the module-level pending-skip
-    # list in cron/jobs.py would otherwise leak an undrained event from one
-    # test (e.g. a direct get_due_jobs() call that never calls
-    # drain_skip_notices()) into the next.
-    j._pending_skip_events.clear()
     return tmp_path
 
 
@@ -147,6 +150,73 @@ class TestWithinDeadlineStillFires:
         assert persisted["last_status"] != "skipped_stale"
 
 
+class TestDeadlineBelowGraceStillSkips:
+    """(f) The deadline is measured from the scheduled slot, independent of
+    the grace window — a deadline smaller than the grace must NOT be
+    silently clamped to it. Regression: with the check nested inside the
+    ``> grace`` gate, ``misfire_deadline_seconds=1800`` on a daily job
+    (grace 7200s) was ignored for anything under 2h late."""
+
+    def test_deadline_below_grace_skips(self, tmp_cron_dir):
+        job = j.create_job(
+            prompt="Good morning!",
+            schedule="every 1h",  # grace = 1800s (half the period)
+            misfire_deadline_seconds=300,  # 5 min — well below the 30-min grace
+        )
+        jobs = j.load_jobs()
+        # 10 minutes late: deadline (300s) < lateness (600s) < grace (1800s).
+        jobs[0]["next_run_at"] = (j._hermes_now() - timedelta(minutes=10)).isoformat()
+        j.save_jobs(jobs)
+
+        due = j.get_due_jobs()
+
+        assert due == [], (
+            "a deadline smaller than the grace window must still skip — the "
+            "deadline is measured from the scheduled slot, not gated on grace"
+        )
+        persisted = j.get_job(job["id"])
+        assert persisted["last_status"] == "skipped_stale"
+        # next_run_at is still fast-forwarded to a future occurrence.
+        next_dt = j._ensure_aware(datetime.fromisoformat(persisted["next_run_at"]))
+        assert next_dt > j._hermes_now()
+
+    def test_below_grace_and_below_deadline_fires(self, tmp_cron_dir):
+        """Sanity companion: within BOTH windows the job fires normally."""
+        job = j.create_job(
+            prompt="Good morning!",
+            schedule="every 1h",
+            misfire_deadline_seconds=900,  # 15 min
+        )
+        jobs = j.load_jobs()
+        # 5 minutes late: inside the deadline and inside the grace.
+        jobs[0]["next_run_at"] = (j._hermes_now() - timedelta(minutes=5)).isoformat()
+        j.save_jobs(jobs)
+
+        due = j.get_due_jobs()
+
+        assert [d["id"] for d in due] == [job["id"]]
+        persisted = j.get_job(job["id"])
+        assert persisted["last_status"] != "skipped_stale"
+
+
+class TestGetDueJobsContract:
+    """(g) get_due_jobs() returns a plain list by default and (due, skips)
+    with include_skips=True — existing callers keep the historical shape."""
+
+    def test_default_shape_is_plain_list(self, tmp_cron_dir):
+        _make_stale_recurring_job(misfire_deadline_seconds=60, hours_late=2)
+        result = j.get_due_jobs()
+        assert isinstance(result, list)
+
+    def test_include_skips_returns_due_and_skips(self, tmp_cron_dir):
+        job = _make_stale_recurring_job(misfire_deadline_seconds=60, hours_late=2)
+        due, skips = j.get_due_jobs(include_skips=True)
+        assert due == []
+        assert len(skips) == 1
+        assert skips[0]["job"]["id"] == job["id"]
+        assert "notice" in skips[0] and "stale" in skips[0]["notice"].lower()
+
+
 class TestCreateJobValidation:
     """(d) misfire_deadline_seconds must be a positive int, or None."""
 
@@ -166,6 +236,75 @@ class TestCreateJobValidation:
         assert job["misfire_deadline_seconds"] == 120
         persisted = j.get_job(job["id"])
         assert persisted["misfire_deadline_seconds"] == 120
+
+
+class TestUpdateJobValidation:
+    """(d) update_job applies the same validation as create_job; explicit
+    None clears the field, an absent key leaves it unchanged."""
+
+    @pytest.mark.parametrize("bad_value", [-1, 0, 1.5, "60", True, False])
+    def test_update_job_rejects_invalid_values(self, tmp_cron_dir, bad_value):
+        job = j.create_job(prompt="x", schedule="every 1h")
+        with pytest.raises(ValueError):
+            j.update_job(job["id"], {"misfire_deadline_seconds": bad_value})
+        persisted = j.get_job(job["id"])
+        assert persisted.get("misfire_deadline_seconds") is None, (
+            "a rejected update must not partially apply"
+        )
+
+    def test_update_job_sets_positive_int(self, tmp_cron_dir):
+        job = j.create_job(prompt="x", schedule="every 1h")
+        j.update_job(job["id"], {"misfire_deadline_seconds": 600})
+        assert j.get_job(job["id"])["misfire_deadline_seconds"] == 600
+
+    def test_update_job_explicit_none_clears(self, tmp_cron_dir):
+        job = j.create_job(prompt="x", schedule="every 1h", misfire_deadline_seconds=600)
+        j.update_job(job["id"], {"misfire_deadline_seconds": None})
+        assert j.get_job(job["id"])["misfire_deadline_seconds"] is None
+
+    def test_update_job_absent_key_leaves_field_unchanged(self, tmp_cron_dir):
+        job = j.create_job(prompt="x", schedule="every 1h", misfire_deadline_seconds=600)
+        j.update_job(job["id"], {"name": "renamed"})
+        assert j.get_job(job["id"])["misfire_deadline_seconds"] == 600
+
+
+class TestCronjobToolUpdate:
+    """(d) The cronjob tool's update action exposes the field: a positive
+    int sets it, 0 clears it, omitting it leaves it unchanged."""
+
+    def test_tool_update_sets_deadline(self, tmp_cron_dir):
+        from tools.cronjob_tools import cronjob
+        job = j.create_job(prompt="x", schedule="every 1h")
+        out = cronjob(action="update", job_id=job["id"], misfire_deadline_seconds=600)
+        assert '"success": true' in out.lower()
+        assert j.get_job(job["id"])["misfire_deadline_seconds"] == 600
+
+    def test_tool_update_zero_clears_deadline(self, tmp_cron_dir):
+        from tools.cronjob_tools import cronjob
+        job = j.create_job(prompt="x", schedule="every 1h", misfire_deadline_seconds=600)
+        out = cronjob(action="update", job_id=job["id"], misfire_deadline_seconds=0)
+        assert '"success": true' in out.lower()
+        assert j.get_job(job["id"])["misfire_deadline_seconds"] is None
+
+    def test_tool_update_omitted_leaves_unchanged(self, tmp_cron_dir):
+        from tools.cronjob_tools import cronjob
+        job = j.create_job(prompt="x", schedule="every 1h", misfire_deadline_seconds=600)
+        out = cronjob(action="update", job_id=job["id"], name="renamed")
+        assert '"success": true' in out.lower()
+        assert j.get_job(job["id"])["misfire_deadline_seconds"] == 600
+
+    def test_tool_create_passes_deadline_through(self, tmp_cron_dir):
+        from tools.cronjob_tools import cronjob
+        import json as _json
+        out = cronjob(
+            action="create",
+            prompt="Good morning!",
+            schedule="every 1h",
+            misfire_deadline_seconds=600,
+        )
+        payload = _json.loads(out)
+        assert payload["success"] is True
+        assert j.get_job(payload["job_id"])["misfire_deadline_seconds"] == 600
 
 
 class TestOneShotUnaffected:
