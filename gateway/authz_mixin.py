@@ -89,20 +89,86 @@ PLATFORM_ALLOWED_USERS_ENV: dict[Platform, str] = {
     Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
 }
 
+# Per-platform group-scoped allowlist env vars, keyed by Platform. Two axes:
+# GROUP_USER gates the sender's user ID for group/forum messages;
+# GROUP_CHAT gates an entire group/forum/channel chat by chat ID. Single
+# source of truth mirroring the two maps above: ``_is_user_authorized``
+# reads these directly (see its "Telegram can optionally authorize group
+# traffic by chat ID" and "TELEGRAM_GROUP_ALLOWED_USERS is the scoped
+# allowlist" comments) and ``format_allowlist_report`` below reports the
+# same maps so the command's output can't drift from what actually gates
+# access.
+PLATFORM_GROUP_USER_ALLOWED_ENV: dict[Platform, str] = {
+    Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
+}
+PLATFORM_GROUP_CHAT_ALLOWED_ENV: dict[Platform, str] = {
+    Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
+    Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+}
+
+# Per-platform ``{PLATFORM}_ALLOW_BOTS`` env vars, keyed by Platform. A bot
+# sender admitted by one of these bypasses the human user-id allowlist
+# entirely (#4466). Single source of truth: ``_is_user_authorized`` reads
+# this directly and ``format_allowlist_report`` below reports the same map.
+PLATFORM_ALLOW_BOTS_ENV: dict[Platform, str] = {
+    Platform.DISCORD: "DISCORD_ALLOW_BOTS",
+    Platform.FEISHU: "FEISHU_ALLOW_BOTS",
+    Platform.TELEGRAM: "TELEGRAM_ALLOW_BOTS",
+    Platform.SLACK: "SLACK_ALLOW_BOTS",
+}
+
+
+def _plugin_platform_env_maps() -> tuple[dict[str, str], dict[str, str]]:
+    """Return (allow_all_env, allowed_users_env) maps for registered plugin
+    platforms, keyed by platform name.
+
+    Mirrors the plugin-registry lookup ``_is_user_authorized`` performs
+    per-call (its "Plugin platforms: check the registry for auth env var
+    names" block) and ``gateway.run._resolve_open_allow_all_platforms``
+    performs for the startup alert, so a plugin platform's env vars show up
+    here too instead of only being visible by reading code. Best-effort:
+    an unavailable/broken registry yields empty maps rather than raising.
+    """
+    allow_all: dict[str, str] = {}
+    allowed_users: dict[str, str] = {}
+    try:
+        from gateway.platform_registry import platform_registry
+        for entry in platform_registry.plugin_entries():
+            if entry.allow_all_env:
+                allow_all[entry.name] = entry.allow_all_env
+            if entry.allowed_users_env:
+                allowed_users[entry.name] = entry.allowed_users_env
+    except Exception:
+        pass
+    return allow_all, allowed_users
+
 
 def format_allowlist_report(pairing_store: "Optional[PairingStore]") -> str:
     """Render the EFFECTIVE authorization sources as compact plain text.
 
-    Backs the ``/allowlist show`` command (finding #29: the owner himself was
-    denied after a restart with no way to answer "why was I denied?" without
+    Backs the ``/allowlist show`` command (the owner himself was denied
+    after a restart with no way to answer "why was I denied?" without
     reading code). Surfaces exactly the sources ``_is_user_authorized``
     actually consults, in the same order it checks them:
 
       1. Global allow-all / global env allowlist.
-      2. Per-platform allow-all flags (``PLATFORM_ALLOW_ALL_ENV``).
-      3. Per-platform env allowlists (``PLATFORM_ALLOWED_USERS_ENV``).
-      4. Paired users from the pairing store (a first-class authorization
+      2. Per-platform allow-all flags (``PLATFORM_ALLOW_ALL_ENV``), plus any
+         plugin platform's own ``allow_all_env`` from the platform registry.
+      3. Per-platform env allowlists (``PLATFORM_ALLOWED_USERS_ENV``), plus
+         any plugin platform's own ``allowed_users_env``.
+      4. Group-scoped allowlists (``PLATFORM_GROUP_USER_ALLOWED_ENV`` /
+         ``PLATFORM_GROUP_CHAT_ALLOWED_ENV``) that gate group/forum/channel
+         traffic separately from the platform-wide allowlist above.
+      5. Bot policy (``PLATFORM_ALLOW_BOTS_ENV``) — a bot sender admitted
+         here bypasses the human user-id allowlist entirely.
+      6. Paired users from the pairing store (a first-class authorization
          grant — see the pairing-store comment in ``_is_user_authorized``).
+
+    This list is deliberately kept in sync with ``_is_user_authorized``: every
+    section below reads from the SAME module-level env-var maps that method
+    consults (rather than a second, independently-maintained list), so the
+    two can't drift apart. If a future change adds a new authorization
+    source to ``_is_user_authorized``, add its env-var map here too.
 
     Nothing here is a secret: these are user-ID allowlists and boolean
     flags, not credentials, so the report prints them in full rather than
@@ -119,10 +185,12 @@ def format_allowlist_report(pairing_store: "Optional[PairingStore]") -> str:
     lines.append(f"  GATEWAY_ALLOWED_USERS: {global_allowlist or '(not set)'}")
     lines.append("")
 
+    plugin_allow_all_env, plugin_allowed_users_env = _plugin_platform_env_maps()
+
     lines.append("Per-platform allow-all flags")
     allow_all_entries = [
         f"  {env_name}: {value}"
-        for env_name in PLATFORM_ALLOW_ALL_ENV.values()
+        for env_name in list(PLATFORM_ALLOW_ALL_ENV.values()) + list(plugin_allow_all_env.values())
         for value in [os.getenv(env_name, "").strip()]
         if value
     ]
@@ -132,11 +200,34 @@ def format_allowlist_report(pairing_store: "Optional[PairingStore]") -> str:
     lines.append("Per-platform env allowlists")
     allowlist_entries = [
         f"  {env_name}: {value}"
-        for env_name in PLATFORM_ALLOWED_USERS_ENV.values()
+        for env_name in list(PLATFORM_ALLOWED_USERS_ENV.values()) + list(plugin_allowed_users_env.values())
         for value in [os.getenv(env_name, "").strip()]
         if value
     ]
     lines.extend(allowlist_entries or ["  (none set)"])
+    lines.append("")
+
+    lines.append("Group allowlists")
+    group_entries = [
+        f"  {env_name}: {value}"
+        for env_name in (
+            list(PLATFORM_GROUP_USER_ALLOWED_ENV.values())
+            + list(PLATFORM_GROUP_CHAT_ALLOWED_ENV.values())
+        )
+        for value in [os.getenv(env_name, "").strip()]
+        if value
+    ]
+    lines.extend(group_entries or ["  (none set)"])
+    lines.append("")
+
+    lines.append("Bot policy (ALLOW_BOTS)")
+    bot_policy_entries = [
+        f"  {env_name}: {value}"
+        for env_name in PLATFORM_ALLOW_BOTS_ENV.values()
+        for value in [os.getenv(env_name, "").strip()]
+        if value
+    ]
+    lines.extend(bot_policy_entries or ["  (none set)"])
     lines.append("")
 
     lines.append("Paired users (pairing store)")
@@ -451,10 +542,7 @@ class GatewayAuthorizationMixin:
         # (website/docs/reference/environment-variables.md,
         # website/docs/user-guide/messaging/telegram.md).
         if source.chat_type in {"group", "forum", "channel"} and source.chat_id:
-            chat_allowlist_env = {
-                Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
-                Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
-            }.get(source.platform, "")
+            chat_allowlist_env = PLATFORM_GROUP_CHAT_ALLOWED_ENV.get(source.platform, "")
             if chat_allowlist_env:
                 raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
                 if raw_chat_allowlist:
@@ -472,14 +560,8 @@ class GatewayAuthorizationMixin:
         # Builder posts arrive as subtype=bot_message with user=None -- so
         # deferring past the guard would reject them outright (the same reason
         # the chat-scoped allowlist above runs early).
-        platform_allow_bots_map = {
-            Platform.DISCORD: "DISCORD_ALLOW_BOTS",
-            Platform.FEISHU: "FEISHU_ALLOW_BOTS",
-            Platform.TELEGRAM: "TELEGRAM_ALLOW_BOTS",
-            Platform.SLACK: "SLACK_ALLOW_BOTS",
-        }
         if getattr(source, "is_bot", False):
-            allow_bots_var = platform_allow_bots_map.get(source.platform)
+            allow_bots_var = PLATFORM_ALLOW_BOTS_ENV.get(source.platform)
             if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True
 
@@ -490,13 +572,8 @@ class GatewayAuthorizationMixin:
         # per-call, and the shared module-level PLATFORM_ALLOWED_USERS_ENV
         # must stay immutable (same pattern as platform_allow_all_map below).
         platform_env_map = dict(PLATFORM_ALLOWED_USERS_ENV)
-        platform_group_user_env_map = {
-            Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
-        }
-        platform_group_chat_env_map = {
-            Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
-            Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
-        }
+        platform_group_user_env_map = PLATFORM_GROUP_USER_ALLOWED_ENV
+        platform_group_chat_env_map = PLATFORM_GROUP_CHAT_ALLOWED_ENV
         # Copy (not alias): the plugin-registry loop right below mutates this
         # per-call with dynamically registered plugin platforms, and the
         # shared module-level PLATFORM_ALLOW_ALL_ENV must stay immutable.
