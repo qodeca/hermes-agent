@@ -1332,18 +1332,36 @@ def _build_child_agent(
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
         parent_api_key = parent_agent._client_kwargs.get("api_key")
 
-    # ── Task-complexity model routing (T25) ─────────────────────────────
+    # ── Task-complexity model routing ────────────────────────────────────
     # Fill the pure parent-inherit gap only: an explicit ``model`` arg
-    # (delegation.model or an internal caller pin) or a delegation
-    # provider/base_url override always wins untouched (precedence:
-    # explicit model > delegation.* config > router > parent inherit).
-    # The router is config-gated (routing.enabled, off by default) and
-    # fail-open — a broken router must never break delegation. When a
-    # decision applies, it is written into ``model`` / ``override_*`` so
-    # the existing override semantics below (api-mode re-derivation
-    # #20558, ACP clearing #16816, provider-filter clearing) apply to the
-    # routed backend unchanged.
-    if not model and not override_provider and not override_base_url:
+    # (delegation.model or an internal caller pin), a delegation
+    # provider/base_url override, or an env-pinned model always wins
+    # untouched (precedence: explicit model > delegation.* config > env pin
+    # > router > parent inherit). The router is config-gated
+    # (routing.enabled, off by default) and fail-open — a broken router must
+    # never break delegation. When a decision applies, it is written into
+    # ``model`` / ``override_*`` so the existing override semantics below
+    # (api-mode re-derivation #20558, ACP clearing #16816, provider-filter
+    # clearing) apply to the routed backend unchanged.
+    #
+    # delegate_task runs in-process, sharing the parent's environment, so an
+    # operator-pinned model is visible here as HERMES_MODEL (the var cron's
+    # own job-model resolution treats as explicit) or HERMES_INFERENCE_MODEL
+    # (oneshot's equivalent). A child normally falls back to
+    # ``getattr(parent_agent, "model", None)`` below when no decision
+    # applies, but that attribute alone can't tell us whether the parent's
+    # model came from an explicit env pin or just its provider's default —
+    # so both vars are checked directly here, matching the union
+    # tui_gateway/server.py's session-startup resolver already treats as an
+    # explicit seed (`hermes --tui -m <model>` sets both together). Without
+    # this, a pinned local endpoint (LM Studio/ollama) reached via any
+    # origin could still have its children handed a tier model it doesn't
+    # serve — the same per-run-failure hazard cron/oneshot already guard
+    # against for their own resolution.
+    _env_model_pinned = bool(os.getenv("HERMES_MODEL", "").strip()) or bool(
+        os.getenv("HERMES_INFERENCE_MODEL", "").strip()
+    )
+    if not model and not override_provider and not override_base_url and not _env_model_pinned:
         try:
             from agent.model_router import RouteContext, route_model
             from hermes_cli.config import load_config_readonly

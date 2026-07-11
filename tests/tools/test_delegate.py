@@ -3689,6 +3689,55 @@ class TestModelRouting(unittest.TestCase):
             model = self._child_model_kwarg(self.ROUTED_CONFIG, model=None)
         self.assertEqual(model, "anthropic/claude-sonnet-4")
 
+    def test_env_pinned_model_skips_routing(self):
+        """HERMES_MODEL pins the model for the whole process (the same var
+        cron's own job-model resolution treats as explicit): a delegate
+        child must not be routed out from under it, even though no
+        delegation.model / provider / base_url override is set. Matches the
+        cron/oneshot answer to the same pinned-backend hazard."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as home:
+            with open(
+                os.path.join(home, "config.yaml"), "w", encoding="utf-8"
+            ) as f:
+                f.write(self.ROUTED_CONFIG)
+            with patch.dict(
+                os.environ, {"HERMES_HOME": home, "HERMES_MODEL": "env-pinned-model"}
+            ):
+                os.environ.pop("HERMES_IGNORE_USER_CONFIG", None)
+                with patch("run_agent.AIAgent") as MockAgent, patch(
+                    "agent.model_router.route_model"
+                ) as route_spy:
+                    mock_child = MagicMock()
+                    mock_child.run_conversation.return_value = {
+                        "final_response": "ok",
+                        "completed": True,
+                        "api_calls": 1,
+                    }
+                    MockAgent.return_value = mock_child
+                    parent = _make_mock_parent(depth=0)
+                    delegate_task(goal="ping", parent_agent=parent)
+                    self.assertTrue(MockAgent.called)
+                    self.assertEqual(route_spy.call_count, 0)
+                    self.assertEqual(
+                        MockAgent.call_args.kwargs.get("model"),
+                        "anthropic/claude-sonnet-4",
+                    )
+
+    def test_routing_disabled_literal_config_inherits_parent_model(self):
+        """A literal ``routing: {enabled: false}`` block (not just an absent
+        routing key) must also be a strict no-op for delegate children."""
+        config = (
+            "routing:\n"
+            "  enabled: false\n"
+            "  tiers:\n"
+            "    light:\n"
+            "      model: routed-child-model\n"
+        )
+        model = self._child_model_kwarg(config, model=None)
+        self.assertEqual(model, "anthropic/claude-sonnet-4")
+
 
 if __name__ == "__main__":
     unittest.main()

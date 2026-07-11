@@ -301,18 +301,27 @@ def _maybe_route_oneshot_model(
     toolsets: Optional[list],
     cfg: dict,
 ) -> Optional[tuple[str, Optional[str], Optional[str]]]:
-    """Consult the task-complexity router for a oneshot run (T26).
+    """Consult the task-complexity router for a oneshot run.
 
     Returns ``(model, provider, base_url)`` when a routed decision applies,
     else ``None``. Callers must already have established that no explicit
     model was requested (arg or env) — the router only fills the
-    global-default gap. A pinned provider (``--provider``) keeps its backend:
-    a model-only tier still applies on it, but a decision that names its own
-    backend is skipped rather than allowed to override the pin.
+    global-default gap. A pinned provider (``--provider``) is treated as an
+    explicit backend choice and skips routing entirely, matching the cron
+    and delegate answer to the same hazard: the router's catalog check
+    accepts unverifiable endpoints (custom base_url, local providers), so it
+    cannot protect a pinned local endpoint (LM Studio/ollama) from being
+    handed a tier model it does not serve. Skipping is the safe default.
 
     Fail-open: guarded import + guarded call — any router failure returns
     ``None`` and the run keeps the configured model resolution.
     """
+    if pinned_provider:
+        logging.info(
+            "oneshot: --provider pins %s; skipping model routing entirely",
+            pinned_provider,
+        )
+        return None
     try:
         from agent.model_router import RouteContext, route_model
 
@@ -325,13 +334,6 @@ def _maybe_route_oneshot_model(
             config=cfg if isinstance(cfg, dict) else {},
         )
         if not decision.model:
-            return None
-        if pinned_provider and (decision.provider or decision.base_url):
-            logging.info(
-                "oneshot: routed decision names backend %s but --provider "
-                "pins %s; keeping pinned backend",
-                decision.provider or decision.base_url, pinned_provider,
-            )
             return None
         return decision.model, decision.provider, decision.base_url
     except Exception as exc:
@@ -423,12 +425,15 @@ def _run_agent(
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
-    # ── Task-complexity model routing (T26) ─────────────────────────────
+    # ── Task-complexity model routing ───────────────────────────────────
     # Fill the GLOBAL-DEFAULT gap only: an explicit model (arg or
-    # HERMES_INFERENCE_MODEL) always wins untouched (precedence: explicit
-    # model > env > router > config default). Config-gated
-    # (routing.enabled, off by default) and fail-open — a broken router or
-    # an unresolvable routed backend must never break a oneshot run.
+    # HERMES_INFERENCE_MODEL) or a pinned --provider always wins untouched
+    # (precedence: explicit model/backend > env > router > config default).
+    # A pinned provider skips routing entirely (matches cron/delegate) rather
+    # than letting a model-only tier apply on top of it — see
+    # _maybe_route_oneshot_model. Config-gated (routing.enabled, off by
+    # default) and fail-open — a broken router or an unresolvable routed
+    # backend must never break a oneshot run.
     runtime = None
     if not ((model or "").strip() or env_model):
         routed = _maybe_route_oneshot_model(

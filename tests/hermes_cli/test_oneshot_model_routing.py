@@ -94,6 +94,18 @@ class TestOneshotRouting:
         assert spy.call_count == 0
         assert agent_kwargs["model"] == "vendor/env-model"
 
+    def test_pinned_provider_skips_routing(self, monkeypatch):
+        """--provider (without --model) is an explicit backend choice: routing
+        is skipped entirely so the pinned endpoint is never handed a tier
+        model it may not serve. The run stays on the config default model,
+        on the pinned provider."""
+        monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+        with patch("agent.model_router.route_model") as spy:
+            agent_kwargs, resolve = _run(cfg=make_config(), provider="openrouter")
+        assert spy.call_count == 0
+        assert agent_kwargs["model"] == DEFAULT_MODEL
+        assert resolve.call_args.kwargs["requested"] == "openrouter"
+
     def test_routing_disabled_uses_config_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
         agent_kwargs, _ = _run(cfg=make_config(enabled=False))
