@@ -1332,6 +1332,81 @@ def _build_child_agent(
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
         parent_api_key = parent_agent._client_kwargs.get("api_key")
 
+    # ── Task-complexity model routing (T25) ─────────────────────────────
+    # Fill the pure parent-inherit gap only: an explicit ``model`` arg
+    # (delegation.model or an internal caller pin) or a delegation
+    # provider/base_url override always wins untouched (precedence:
+    # explicit model > delegation.* config > router > parent inherit).
+    # The router is config-gated (routing.enabled, off by default) and
+    # fail-open — a broken router must never break delegation. When a
+    # decision applies, it is written into ``model`` / ``override_*`` so
+    # the existing override semantics below (api-mode re-derivation
+    # #20558, ACP clearing #16816, provider-filter clearing) apply to the
+    # routed backend unchanged.
+    if not model and not override_provider and not override_base_url:
+        try:
+            from agent.model_router import RouteContext, route_model
+            from hermes_cli.config import load_config_readonly
+
+            _routing_cfg = load_config_readonly()
+            _route_decision = route_model(
+                goal or "",
+                context=RouteContext(
+                    origin="delegate",
+                    toolsets=tuple(child_toolsets or ()),
+                ),
+                config=_routing_cfg if isinstance(_routing_cfg, dict) else {},
+            )
+            if _route_decision.model:
+                if _route_decision.provider:
+                    # The routed tier names its own provider — resolve the
+                    # full credential bundle the same way delegation.provider
+                    # does. Failure raises into the fail-open except below,
+                    # skipping the decision instead of pairing the routed
+                    # provider with the parent's API key.
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                    _route_kwargs = {
+                        "requested": _route_decision.provider,
+                        "target_model": _route_decision.model,
+                    }
+                    if _route_decision.base_url:
+                        _route_kwargs["explicit_base_url"] = _route_decision.base_url
+                    _routed_runtime = resolve_runtime_provider(**_route_kwargs)
+                    model = _route_decision.model
+                    override_provider = (
+                        _routed_runtime.get("provider") or _route_decision.provider
+                    )
+                    override_base_url = _routed_runtime.get("base_url") or None
+                    override_api_key = _routed_runtime.get("api_key") or None
+                    override_api_mode = _routed_runtime.get("api_mode") or None
+                elif _route_decision.base_url:
+                    # Direct endpoint tier — mirror the delegation.base_url
+                    # branch of _resolve_delegation_credentials: custom
+                    # provider, URL-detected api_mode, parent-inherited key.
+                    from hermes_cli.runtime_provider import _detect_api_mode_for_url
+
+                    model = _route_decision.model
+                    override_provider = "custom"
+                    override_base_url = _route_decision.base_url
+                    override_api_mode = (
+                        _detect_api_mode_for_url(_route_decision.base_url)
+                        or "chat_completions"
+                    )
+                else:
+                    # Same-backend tier: only the model changes.
+                    model = _route_decision.model
+                logger.debug(
+                    "model_router: delegate child %s applying tier=%s model=%s",
+                    subagent_id, _route_decision.tier, _route_decision.model,
+                )
+        except Exception as _route_exc:
+            logger.warning(
+                "delegate: model routing unavailable/failed (%s); "
+                "inheriting parent model",
+                _route_exc,
+            )
+
     # Resolve the child's effective model early so it can ride on every event.
     effective_model_for_cb = model or getattr(parent_agent, "model", None)
 

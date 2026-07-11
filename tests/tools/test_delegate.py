@@ -3600,5 +3600,95 @@ class TestCapacityFallbackBound(unittest.TestCase):
         self.assertIs(parent._interrupt_requested, False)
 
 
+class TestModelRouting(unittest.TestCase):
+    """T25: task-complexity routing for delegate children.
+
+    The router (config-gated, off by default) fills the pure
+    parent-inherit gap only: no explicit ``model`` arg and no
+    delegation.model / delegation.provider / delegation.base_url
+    override. Exercised against a temp HERMES_HOME with a real
+    config.yaml so the real config loader feeds the router.
+    """
+
+    ROUTED_CONFIG = (
+        "routing:\n"
+        "  enabled: true\n"
+        "  tiers:\n"
+        "    light:\n"
+        "      model: routed-child-model\n"
+    )
+
+    def _child_model_kwarg(self, config_text, via_delegate_task=False, **build_kwargs):
+        """Run _build_child_agent (or full delegate_task) under a temp
+        HERMES_HOME containing config_text; return AIAgent's model kwarg."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as home:
+            with open(
+                os.path.join(home, "config.yaml"), "w", encoding="utf-8"
+            ) as f:
+                f.write(config_text)
+            with patch.dict(os.environ, {"HERMES_HOME": home}):
+                os.environ.pop("HERMES_IGNORE_USER_CONFIG", None)
+                with patch("run_agent.AIAgent") as MockAgent:
+                    mock_child = MagicMock()
+                    mock_child.run_conversation.return_value = {
+                        "final_response": "ok",
+                        "completed": True,
+                        "api_calls": 1,
+                    }
+                    MockAgent.return_value = mock_child
+                    parent = _make_mock_parent(depth=0)
+                    if via_delegate_task:
+                        delegate_task(goal="ping", parent_agent=parent)
+                    else:
+                        _build_child_agent(
+                            task_index=0,
+                            goal="ping",
+                            context=None,
+                            toolsets=None,
+                            max_iterations=10,
+                            parent_agent=parent,
+                            task_count=1,
+                            **build_kwargs,
+                        )
+                    self.assertTrue(MockAgent.called)
+                    return MockAgent.call_args.kwargs.get("model")
+
+    def test_parent_default_child_is_routed(self):
+        """No explicit model, no delegation.* override -> the routed
+        light-tier model reaches the child agent (full delegate_task path)."""
+        model = self._child_model_kwarg(
+            self.ROUTED_CONFIG, via_delegate_task=True
+        )
+        self.assertEqual(model, "routed-child-model")
+
+    def test_delegation_model_config_wins_untouched(self):
+        """delegation.model pins the child model; the router must not run."""
+        config = "delegation:\n  model: pinned-child\n" + self.ROUTED_CONFIG
+        model = self._child_model_kwarg(config, via_delegate_task=True)
+        self.assertEqual(model, "pinned-child")
+
+    def test_explicit_model_arg_wins_untouched(self):
+        """An explicit model arg (internal caller pin) beats the router."""
+        model = self._child_model_kwarg(self.ROUTED_CONFIG, model="explicit-child")
+        self.assertEqual(model, "explicit-child")
+
+    def test_routing_disabled_inherits_parent_model(self):
+        """No routing block -> child inherits the parent model (no-op)."""
+        model = self._child_model_kwarg("{}\n", model=None)
+        self.assertEqual(model, "anthropic/claude-sonnet-4")
+
+    def test_broken_router_fails_open_to_parent_model(self):
+        """A router that raises must never break delegation: the child
+        still inherits the parent model."""
+        with patch(
+            "agent.model_router.route_model",
+            side_effect=RuntimeError("router exploded"),
+        ):
+            model = self._child_model_kwarg(self.ROUTED_CONFIG, model=None)
+        self.assertEqual(model, "anthropic/claude-sonnet-4")
+
+
 if __name__ == "__main__":
     unittest.main()
