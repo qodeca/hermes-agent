@@ -532,6 +532,20 @@ prompt_caching:
 #                           # extra_body:
 #                           #   chat_template_kwargs:
 #                           #     enable_thinking: false
+#
+#   # Task-complexity model router's optional LLM tie-break classifier —
+#   # used only when routing.classifier: "llm" (see the top-level `routing`
+#   # block further down). Same provider/model/base_url/api_key/timeout/
+#   # extra_body shape as auxiliary.compression. Keep this on a fast, cheap
+#   # model — routing falls back to routing.default_tier on any failure or
+#   # timeout, so a slow classifier must never delay a conversation start.
+#   routing:
+#     provider: "auto"
+#     model: ""
+#     base_url: ""
+#     api_key: ""
+#     timeout: 8
+#     extra_body: {}
 
 # =============================================================================
 # Persistent Memory
@@ -706,6 +720,26 @@ agent:
   # underneath this wrapper — this is the Hermes-level loop.
   # api_max_retries: 3
 
+  # Circuit breaker: abort the conversation after this many CONSECUTIVE
+  # backend API failures (resets to 0 on any successful call). Default 10,
+  # 0 = disabled.
+  # max_consecutive_api_failures: 10
+
+  # Cumulative output-token budget for one session; on exceed, the loop
+  # ends cleanly via a final grace call. Default 0 = unlimited. Cron
+  # sessions use the lower cron.session_output_token_budget instead when
+  # this key is unset.
+  # session_output_token_budget: 0
+
+  # Default per-call max_tokens sent when agent.max_tokens is unset.
+  # Default 0 = leave to provider default.
+  # default_max_tokens: 0
+
+  # Repetition/degeneration detector for INTERACTIVE sessions. Default
+  # false — a human watching the stream can see and interrupt a loop.
+  # Cron sessions default to true via cron.degeneration_detection.
+  # degeneration_detection: false
+
   # After the agent edits code without fresh passing verification, nudge it to
   # verify before finishing. The default "auto" enables it on interactive
   # coding surfaces (CLI, TUI, desktop) and programmatic callers, and disables
@@ -757,6 +791,114 @@ agent:
     uwu: "hewwo! i'm your fwiendwy assistant uwu~ i wiww twy my best to hewp you! *nuzzles your code* OwO what's this? wet me take a wook! i pwomise to be vewy hewpful >w<"
     philosopher: "Greetings, seeker of wisdom. I am an assistant who contemplates the deeper meaning behind every query. Let us examine not just the 'how' but the 'why' of your questions. Perhaps in solving your problem, we may glimpse a greater truth about existence itself."
     hype: "YOOO LET'S GOOOO!!! 🔥🔥🔥 I am SO PUMPED to help you today! Every question is AMAZING and we're gonna CRUSH IT together! This is gonna be LEGENDARY! ARE YOU READY?! LET'S DO THIS! 💪😤🚀"
+
+# =============================================================================
+# Cron Job Execution (Resource Limits)
+# =============================================================================
+# Resource caps for unattended scheduled jobs. See also HERMES_CRON_TIMEOUT
+# (inactivity timeout) and HERMES_CRON_MAX_RUNTIME (wall-clock cap, wins
+# over cron.max_runtime_seconds below) in .env. All keys optional — shown
+# here at their built-in defaults, so copying this block as-is is a no-op.
+#
+# cron:
+#   # Byte cap on a single run's STORED output file (head 60% + tail 30%
+#   # kept, middle elided with a marker). The DELIVERED chat text is a
+#   # separate budget, bounded by the per-turn token budget.
+#   output_max_bytes: 262144
+#
+#   # Wall-clock runtime cap per cron run, regardless of activity. 0 or
+#   # negative = unlimited (the inactivity timeout is then the only bound).
+#   # HERMES_CRON_MAX_RUNTIME env var takes precedence over this value.
+#   max_runtime_seconds: 3600
+#
+#   # Cron agent-loop iteration cap — lower than interactive sessions
+#   # (agent.max_turns) since a confused/looping unattended job otherwise
+#   # gets a very long rope. Non-positive values are treated as UNSET
+#   # (falls back to agent.max_turns, then this default) — NOT "unlimited".
+#   max_iterations: 40
+#
+#   # Session output-token budget for CRON sessions — lower than
+#   # interactive because a runaway scheduled job burns unattended.
+#   # Applies only when agent.session_output_token_budget is unset in
+#   # config.yaml. 0 = unlimited.
+#   session_output_token_budget: 200000
+#
+#   # Repetition/degeneration detector for CRON sessions — ON by default
+#   # because nobody is watching an unattended job loop. Applies only when
+#   # agent.degeneration_detection is unset; an explicit agent-level value
+#   # always wins.
+#   degeneration_detection: true
+
+# =============================================================================
+# Operator Alerts
+# =============================================================================
+# Minimal, fire-and-forget notifications (security warnings, cron job
+# failures) that would otherwise sit unnoticed in errors.log. Reuses the
+# existing cron delivery machinery — not a new platform integration.
+#
+# alerts:
+#   # Where to deliver alerts, same "platform:chat_id" format cron's own
+#   # `deliver` field accepts (e.g. "telegram:8393438634"). Empty string =
+#   # disabled (the default) — alerts silently no-op until you opt in.
+#   deliver: ""
+
+# =============================================================================
+# Task-Complexity Model Router (Advanced — Experimental)
+# =============================================================================
+# Picks a model tier (light / standard / heavy) per task at conversation
+# start, so a one-line reminder doesn't run on the same heavyweight model
+# as a multi-hour research job. OFF BY DEFAULT — the block below is shown
+# fully expanded but disabled, so copying this file as-is is a no-op.
+# See agent/model_router.py for the decision logic.
+#
+# Precedence (highest first) — the router never overrides an explicit
+# choice: explicit per-job/per-call model > HERMES_MODEL env > session
+# /model or channel override > router > global default.
+#
+# An empty tier model means "keep the existing resolution" for that tier,
+# so the expected steady state is: configure only `light` (and optionally
+# `heavy`), leave `standard` empty — the router is then a pure delta on
+# today's behaviour.
+#
+# routing:
+#   enabled: false
+#   # Which conversation origins the router applies to. Anything not
+#   # listed keeps its existing model resolution untouched.
+#   apply_to: [cron, delegate]   # cron | delegate | gateway | oneshot
+#   # heuristic — deterministic rules only (default).
+#   # llm       — heuristics first; an auxiliary LLM call breaks ties
+#   #             (configure the backend under auxiliary.routing).
+#   # off       — no classification; every routed task gets default_tier.
+#   classifier: heuristic
+#   # Tier used when no heuristic is decisive (or the classifier fails).
+#   default_tier: standard
+#   tiers:
+#     light:
+#       provider: ""
+#       model: ""
+#       base_url: ""
+#     standard:
+#       provider: ""
+#       model: ""
+#       base_url: ""
+#     heavy:
+#       provider: ""
+#       model: ""
+#       base_url: ""
+#   heuristics:
+#     # Task text at or under this length (chars) reads as light, unless a
+#     # heavy signal (toolset/keyword/length/structure) won first.
+#     light_max_chars: 280
+#     # Task text at or over this length (chars) reads as heavy.
+#     heavy_min_chars: 4000
+#     light_keywords: [remind, greet, ping, notify, "send a message"]
+#     heavy_keywords: [research, investigate, comprehensive, "deep dive", migrate, refactor, crawl]
+#     # Toolsets whose presence marks a task heavy outright. Gateway
+#     # platforms commonly attach "browser", so the default here will
+#     # floor most gateway sessions at heavy whenever gateway routing is
+#     # enabled — tune this list down for gateway use if that's not the
+#     # intended trade-off.
+#     heavy_toolsets: [browser, delegation]
 
 # =============================================================================
 # Toolsets
