@@ -294,6 +294,55 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _maybe_route_oneshot_model(
+    prompt: str,
+    *,
+    pinned_provider: Optional[str],
+    toolsets: Optional[list],
+    cfg: dict,
+) -> Optional[tuple[str, Optional[str], Optional[str]]]:
+    """Consult the task-complexity router for a oneshot run (T26).
+
+    Returns ``(model, provider, base_url)`` when a routed decision applies,
+    else ``None``. Callers must already have established that no explicit
+    model was requested (arg or env) — the router only fills the
+    global-default gap. A pinned provider (``--provider``) keeps its backend:
+    a model-only tier still applies on it, but a decision that names its own
+    backend is skipped rather than allowed to override the pin.
+
+    Fail-open: guarded import + guarded call — any router failure returns
+    ``None`` and the run keeps the configured model resolution.
+    """
+    try:
+        from agent.model_router import RouteContext, route_model
+
+        decision = route_model(
+            prompt or "",
+            context=RouteContext(
+                origin="oneshot",
+                toolsets=tuple(toolsets or ()),
+            ),
+            config=cfg if isinstance(cfg, dict) else {},
+        )
+        if not decision.model:
+            return None
+        if pinned_provider and (decision.provider or decision.base_url):
+            logging.info(
+                "oneshot: routed decision names backend %s but --provider "
+                "pins %s; keeping pinned backend",
+                decision.provider or decision.base_url, pinned_provider,
+            )
+            return None
+        return decision.model, decision.provider, decision.base_url
+    except Exception as exc:
+        logging.warning(
+            "oneshot: model routing unavailable/failed (%s: %s); "
+            "keeping configured model",
+            type(exc).__name__, exc,
+        )
+        return None
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
@@ -366,18 +415,57 @@ def _run_agent(
                 if detected:
                     effective_provider, effective_model = detected
 
-    runtime = resolve_runtime_provider(
-        requested=effective_provider,
-        target_model=effective_model or None,
-        explicit_base_url=explicit_base_url_from_alias,
-    )
-
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
-    # sets; explicit values preserve user order.
+    # sets; explicit values preserve user order. Resolved before routing so
+    # the router sees the same toolsets the agent will run with.
     toolsets_list = _normalize_toolsets(toolsets)
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+
+    # ── Task-complexity model routing (T26) ─────────────────────────────
+    # Fill the GLOBAL-DEFAULT gap only: an explicit model (arg or
+    # HERMES_INFERENCE_MODEL) always wins untouched (precedence: explicit
+    # model > env > router > config default). Config-gated
+    # (routing.enabled, off by default) and fail-open — a broken router or
+    # an unresolvable routed backend must never break a oneshot run.
+    runtime = None
+    if not ((model or "").strip() or env_model):
+        routed = _maybe_route_oneshot_model(
+            prompt,
+            pinned_provider=effective_provider,
+            toolsets=toolsets_list,
+            cfg=cfg,
+        )
+        if routed is not None:
+            r_model, r_provider, r_base_url = routed
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=r_provider or effective_provider,
+                    target_model=r_model,
+                    explicit_base_url=r_base_url or explicit_base_url_from_alias,
+                )
+            except Exception as exc:
+                # Routed backend did not resolve — keep the configured
+                # resolution instead of failing the run.
+                logging.warning(
+                    "oneshot: routed backend did not resolve (%s); "
+                    "keeping configured model", exc,
+                )
+                runtime = None
+            else:
+                effective_model = r_model
+                if r_provider:
+                    effective_provider = r_provider
+                if r_base_url:
+                    explicit_base_url_from_alias = r_base_url
+
+    if runtime is None:
+        runtime = resolve_runtime_provider(
+            requested=effective_provider,
+            target_model=effective_model or None,
+            explicit_base_url=explicit_base_url_from_alias,
+        )
 
     session_db = _create_session_db_for_oneshot()
     # Read the effective fallback chain from profile config so oneshot workers
