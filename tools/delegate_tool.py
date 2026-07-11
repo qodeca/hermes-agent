@@ -1384,15 +1384,20 @@ def _build_child_agent(
                     # Direct endpoint tier — mirror the delegation.base_url
                     # branch of _resolve_delegation_credentials: custom
                     # provider, URL-detected api_mode, parent-inherited key.
+                    # Detect api_mode BEFORE mutating any override so a raise
+                    # in the detector cannot leave the child on a custom
+                    # base_url with no api_mode while the except logs
+                    # "inheriting parent".
                     from hermes_cli.runtime_provider import _detect_api_mode_for_url
 
-                    model = _route_decision.model
-                    override_provider = "custom"
-                    override_base_url = _route_decision.base_url
-                    override_api_mode = (
+                    _routed_api_mode = (
                         _detect_api_mode_for_url(_route_decision.base_url)
                         or "chat_completions"
                     )
+                    model = _route_decision.model
+                    override_provider = "custom"
+                    override_base_url = _route_decision.base_url
+                    override_api_mode = _routed_api_mode
                 else:
                     # Same-backend tier: only the model changes.
                     model = _route_decision.model

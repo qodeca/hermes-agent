@@ -3419,11 +3419,20 @@ def run_job(
         _enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
 
         # ── Task-complexity model routing (T25) ──────────────────────────
-        # Fill the GLOBAL-DEFAULT gap only: an explicit job.model or a
-        # HERMES_MODEL env override always wins untouched (precedence:
-        # job.model > HERMES_MODEL > router > config default). The router
-        # is config-gated (routing.enabled, off by default) and fail-open —
-        # a broken router must never take down cron.
+        # Fill the GLOBAL-DEFAULT gap only: an explicit job.model, a
+        # HERMES_MODEL env override, or a pinned job.provider/base_url all
+        # win untouched (precedence: explicit model/backend > router >
+        # config default). The router is config-gated (routing.enabled, off
+        # by default) and fail-open — a broken router must never take down
+        # cron.
+        #
+        # A pinned provider/base_url is treated as an explicit backend
+        # choice and suppresses routing entirely (matching the delegate
+        # side, which skips routing on ANY backend override): the router's
+        # read-only catalog check accepts unverifiable endpoints (custom
+        # base_url, local providers), so it cannot protect a pinned local
+        # endpoint (LM Studio/ollama) from being handed a tier model it
+        # does not serve — per-fire failures. Skipping is the safe answer.
         #
         # Placed AFTER the #44585 drift guard on purpose: the guard
         # compares the global-default resolution against the creation-time
@@ -3431,8 +3440,13 @@ def run_job(
         # the routed model. The route is a deterministic per-fire
         # recomputation recorded in run stats for observability only —
         # never snapshotted, never drift-guarded.
-        _explicit_model = bool(str(job.get("model") or "").strip()) or bool(
-            os.getenv("HERMES_MODEL", "").strip()
+        _backend_pinned = bool(str(job.get("provider") or "").strip()) or bool(
+            str(job.get("base_url") or "").strip()
+        )
+        _explicit_model = (
+            bool(str(job.get("model") or "").strip())
+            or bool(os.getenv("HERMES_MODEL", "").strip())
+            or _backend_pinned
         )
         if not _explicit_model:
             _route_decision = None
@@ -3461,26 +3475,6 @@ def run_job(
                     "keeping default model",
                     job_id, _route_exc,
                 )
-            # A job that pins provider/base_url (but not model) keeps its
-            # pinned backend: a model-only tier still applies on it, but a
-            # decision that names its own backend is skipped rather than
-            # allowed to override an explicit pin.
-            _backend_pinned = bool(str(job.get("provider") or "").strip()) or bool(
-                str(job.get("base_url") or "").strip()
-            )
-            if (
-                _route_decision is not None
-                and _route_decision.model
-                and (_route_decision.provider or _route_decision.base_url)
-                and _backend_pinned
-            ):
-                logger.info(
-                    "model_router: origin=cron job=%s decision names backend "
-                    "%s but job pins provider/base_url; keeping pinned backend",
-                    job_name,
-                    _route_decision.provider or _route_decision.base_url,
-                )
-                _route_decision = None
             if _route_decision is not None and _route_decision.model:
                 _routed_runtime = runtime
                 if _route_decision.provider or _route_decision.base_url:
@@ -3490,7 +3484,14 @@ def run_job(
                     # (fail-open) instead of pairing the routed model with
                     # the default provider's credentials.
                     try:
-                        _route_kwargs = {"requested": _route_decision.provider}
+                        _route_kwargs = {
+                            "requested": _route_decision.provider,
+                            # Model-switching callers must pass target_model so
+                            # api_mode derives from the routed model, not the
+                            # stale config default (resolve_runtime_provider
+                            # docstring) — matters on model-dependent providers.
+                            "target_model": _route_decision.model,
+                        }
                         if _route_decision.base_url:
                             _route_kwargs["explicit_base_url"] = _route_decision.base_url
                         _routed_runtime = resolve_runtime_provider(**_route_kwargs)

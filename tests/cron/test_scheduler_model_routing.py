@@ -169,30 +169,23 @@ class TestCronModelRouting:
         assert model == "default-model"
         assert "route" not in (getattr(agent, "_cron_run_stats", None) or {})
 
-    def test_model_only_tier_applies_on_pinned_provider(self, tmp_path):
-        """A job that pins provider (but not model) still gets model-only
-        routing: the tier names no backend, so the pinned backend is kept
-        and only the model is swapped."""
+    def test_pinned_provider_skips_routing(self, tmp_path):
+        """A job that pins provider (but not model) is treated as an
+        explicit backend choice: routing is skipped entirely so the pinned
+        endpoint is never handed a tier model it may not serve. The job
+        runs on its resolved default model, untouched."""
         job = _base_job(provider="openrouter")
-        model, _agent = _run_job_with_config(job, ROUTED_CONFIG, tmp_path)
-        assert model == "light-model"
+        model, agent = _run_job_with_config(job, ROUTED_CONFIG, tmp_path)
+        assert model == "default-model"
+        assert "route" not in (getattr(agent, "_cron_run_stats", None) or {})
 
-    def test_backend_naming_tier_skipped_on_pinned_provider(self, tmp_path):
-        """A decision that names its own backend must never override a
-        job's explicitly pinned provider/base_url — the decision is
-        skipped and the global default model is kept."""
-        config = (
-            "model:\n"
-            "  default: default-model\n"
-            "routing:\n"
-            "  enabled: true\n"
-            "  tiers:\n"
-            "    light:\n"
-            "      provider: openrouter\n"
-            "      model: light-model\n"
-        )
-        job = _base_job(provider="nous")
-        model, agent = _run_job_with_config(job, config, tmp_path)
+    def test_pinned_base_url_skips_routing(self, tmp_path):
+        """A pinned base_url is likewise an explicit backend choice that
+        suppresses routing (e.g. a local LM Studio/ollama endpoint that
+        serves only its loaded model). A base_url pin requires a provider
+        (the credential-exfil guard blocks a bare base_url), so pin both."""
+        job = _base_job(provider="custom", base_url="https://local.invalid/v1")
+        model, agent = _run_job_with_config(job, ROUTED_CONFIG, tmp_path)
         assert model == "default-model"
         assert "route" not in (getattr(agent, "_cron_run_stats", None) or {})
 
