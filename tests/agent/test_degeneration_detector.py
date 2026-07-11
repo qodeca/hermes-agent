@@ -71,6 +71,21 @@ def test_single_normal_message_is_not_degenerate():
     assert looks_degenerate([VARIED_PARAGRAPHS[0]]) is None
 
 
+def test_short_near_identical_narration_does_not_strike():
+    """Legitimate short cron narration that repeats with one changed token
+    each run must NOT strike. Each line is 15 words → 8 distinct 8-grams,
+    below MIN_NGRAMS (10), so the overlap signal is suppressed even though
+    the raw overlap (7/8 ≈ 88%) is well over the 60% threshold. Pins the
+    MIN_NGRAMS guard against a future threshold reduction that would
+    false-positive on progressing-but-similar narration."""
+    base = "checked the rss feed and queued new items for review at time slot number {}"
+    texts = [base.format(i) for i in range(4)]
+    # Precondition: the newest text really is under the MIN_NGRAMS floor.
+    from agent.degeneration_detector import MIN_NGRAMS, _ngrams
+    assert len(_ngrams(texts[-1], 8)) < MIN_NGRAMS
+    assert looks_degenerate(texts) is None
+
+
 # ── (c) thresholds: just-under / just-over boundaries ────────────────────
 
 def _overlap_pair(shared_words: int, new_words: int):

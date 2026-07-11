@@ -4,8 +4,8 @@ A looping model can emit the same deliberation endlessly while staying
 inside every other guard: ``max_iterations`` counts tool calls, the
 failure breaker counts errors, and the session output-token budget needs
 volume to accumulate first. Observed incident: a trivial cron job emitted
-261,333 bytes of "I'm done. Let me write the response now. Final: Hello
-Marcin!" before finally answering.
+261,333 bytes of "I'm done. Let me write the response now." repeated for
+hundreds of KB before finally answering.
 
 ``looks_degenerate`` scores the newest assistant text with two cheap,
 deterministic signals — no I/O, no model calls:

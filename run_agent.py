@@ -3045,6 +3045,14 @@ class AIAgent:
                 "final answer. Raise `agent.session_output_token_budget` "
                 "(0 = unlimited) or start a new session."
             )
+        if reason == "degeneration_detected":
+            return (
+                prefix
+                + "the model was repeating itself without making progress "
+                "(degeneration loop detected), so the turn was stopped. "
+                "Send `continue` to retry, or disable "
+                "`agent.degeneration_detection` if this was a false positive."
+            )
         if reason == "ollama_runtime_context_too_small":
             return (
                 prefix

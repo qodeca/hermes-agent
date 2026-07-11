@@ -219,6 +219,15 @@ def test_first_detection_steers_second_consecutive_exits(agent_env):
     assert len(handler.captured_requests) == 2
     assert result["turn_exit_reason"] == "degeneration_detected"
 
+    # The exit must not be a silent empty turn: the turn-completion
+    # explainer replaces the blank response with a message naming the
+    # detection, so interactive users see WHY it stopped and cron gets a
+    # meaningful failure string instead of "agent reported failure".
+    _resp = (result["final_response"] or "")
+    assert _resp.strip(), "second-strike exit produced a silent empty turn"
+    assert "degeneration" in _resp.lower()
+    assert result["completed"] is False
+
     # The steering note rode the newest tool result of request 2.
     steer_req_tool_msgs = _tool_messages(handler.captured_requests[1])
     assert steer_req_tool_msgs, "steered request lost the tool result"
@@ -228,8 +237,11 @@ def test_first_detection_steers_second_consecutive_exits(agent_env):
     for m in _tool_messages(handler.captured_requests[0]):
         assert STEER_MARKER not in m["content"]
 
-    # Transcript: ends on a complete assistant+tool turn, strict alternation,
-    # and no user/system message was injected mid-loop.
+    # Transcript: the loop broke at the top-of-loop check on a complete
+    # assistant+tool turn (same terminal shape as output_budget_exhausted);
+    # the explainer rides result["final_response"], not the transcript.
+    # Strict alternation holds and no user/system message was injected
+    # mid-loop.
     msgs = result["messages"]
     assert msgs[-1]["role"] == "tool"
     _assert_valid_transcript(msgs)
