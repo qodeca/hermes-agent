@@ -15,6 +15,7 @@ import pytest
 from agent.model_router import (
     RouteContext,
     RouteDecision,
+    _tier_model_available,
     route_model,
 )
 
@@ -126,6 +127,26 @@ class TestHeuristicTiers:
         d = route_model(text, context=ctx(), config=make_config())
         assert d.tier == "heavy"
 
+    def test_skills_floor_at_standard_when_no_heavy_signal(self):
+        # A short greeting would classify light, but attached skills floor
+        # the tier at standard (T25/T26 build against this shape).
+        d = route_model(GREETING, context=ctx(skills=("some-skill",)), config=make_config())
+        assert d.tier == "standard"
+        assert d.model == STANDARD_MODEL
+
+    def test_skills_do_not_promote_past_standard(self):
+        # The floor is exactly standard — skills must not push to heavy.
+        d = route_model(GREETING, context=ctx(skills=("a", "b")), config=make_config())
+        assert d.tier == "standard"
+
+    def test_heavy_toolset_still_wins_over_skills_floor(self):
+        d = route_model(
+            GREETING,
+            context=ctx(skills=("some-skill",), toolsets=("browser",)),
+            config=make_config(),
+        )
+        assert d.tier == "heavy"
+
     def test_ambiguous_text_uses_default_tier(self):
         text = AMBIGUOUS_TEXT
         cfg = make_config()
@@ -196,6 +217,72 @@ class TestCatalogFallThrough:
         d = route_model(GREETING, context=ctx(), config=make_config())
         assert_noop(d)
         assert d.reason
+
+
+class TestTierModelAvailableIsReadOnly:
+    """The catalog check must never touch the network on the hot path.
+
+    It consults only the on-disk provider-catalog cache — never the live
+    ``provider_model_ids`` / ``cached_provider_model_ids`` fetch path, which
+    can block on a synchronous HTTP GET during conversation start.
+    """
+
+    def _forbid_live_fetch(self, monkeypatch):
+        def _boom(*args, **kwargs):
+            raise AssertionError("live catalog fetch must not run in the router hot path")
+
+        monkeypatch.setattr("hermes_cli.models.provider_model_ids", _boom)
+        monkeypatch.setattr("hermes_cli.models.cached_provider_model_ids", _boom)
+
+    def test_never_calls_live_fetch_path(self, monkeypatch):
+        self._forbid_live_fetch(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.models._load_provider_models_cache",
+            lambda: {"openrouter": {"models": [LIGHT_MODEL]}},
+        )
+        # Present in cache → available; absent → not; neither path fetches live.
+        assert _tier_model_available("openrouter", LIGHT_MODEL, "") is True
+        assert _tier_model_available("openrouter", "vendor/absent-model", "") is False
+
+    def test_cold_cache_accepts_tier(self, monkeypatch):
+        # Cold/empty/absent cache must NOT suppress routing (accept → True).
+        self._forbid_live_fetch(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.models._load_provider_models_cache", lambda: {}
+        )
+        assert _tier_model_available("openrouter", LIGHT_MODEL, "") is True
+
+    def test_provider_missing_from_cache_accepts_tier(self, monkeypatch):
+        self._forbid_live_fetch(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.models._load_provider_models_cache",
+            lambda: {"anthropic": {"models": ["claude-x"]}},
+        )
+        assert _tier_model_available("openrouter", LIGHT_MODEL, "") is True
+
+    def test_base_url_and_auto_provider_skip_catalog(self, monkeypatch):
+        def _boom():
+            raise AssertionError("catalog must not be read for base_url/auto tiers")
+
+        monkeypatch.setattr("hermes_cli.models._load_provider_models_cache", _boom)
+        assert _tier_model_available("custom", "m", "http://localhost:1234/v1") is True
+        assert _tier_model_available("auto", "m", "") is True
+        assert _tier_model_available("", "m", "") is True
+
+    def test_end_to_end_route_uses_only_disk_cache(self, monkeypatch):
+        # Full route_model path with the real _tier_model_available: a cold
+        # cache leaves a configured tier usable and never fetches live.
+        # Restore the real check (the autouse fixture stubbed it True).
+        monkeypatch.setattr(
+            "agent.model_router._tier_model_available", _tier_model_available
+        )
+        self._forbid_live_fetch(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.models._load_provider_models_cache", lambda: {}
+        )
+        d = route_model(GREETING, context=ctx(), config=make_config())
+        assert d.tier == "light"
+        assert d.model == LIGHT_MODEL
 
 
 # ─── fail-open safety ────────────────────────────────────────────────────────

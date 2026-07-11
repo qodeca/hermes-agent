@@ -214,11 +214,19 @@ def _tier_model_available(provider: str, model: str, base_url: str) -> bool:
     """Read-only check that a tier's model resolves in the local model catalog.
 
     This is the seam where a future host-capacity predicate (e.g. "is the
-    local server able to load this model right now?") slots in. Today it
-    consults the cached provider catalogs in :mod:`hermes_cli.models`.
-    Unverifiable cases (custom base_url, unknown provider, empty catalog,
-    lookup errors) are accepted — the check guards against config typos, it
-    must not veto legitimately configured offline backends.
+    local server able to load this model right now?") slots in. It is
+    STRICTLY read-only and must stay off the network: it consults only the
+    *on-disk* provider-catalog cache (``_load_provider_models_cache``), never
+    the live ``provider_model_ids`` / ``cached_provider_model_ids`` fetch
+    path — a synchronous catalog fetch here would block conversation start by
+    up to the fetch timeout, which is unacceptable on this hot path.
+
+    Unverifiable cases are accepted (returns True, i.e. "use the tier"):
+    custom base_url, unknown/auto provider, a cold or absent cache, a
+    provider missing from the cache, or any lookup error. The check exists
+    to catch config typos where the model is present in a populated cache but
+    the tier's model isn't in it; it must never suppress a legitimately
+    configured backend just because the cache hasn't been warmed yet.
     """
     if base_url:
         return True  # user-pinned endpoint; no catalog to consult
@@ -226,14 +234,18 @@ def _tier_model_available(provider: str, model: str, base_url: str) -> bool:
     if not prov or prov == "auto":
         return True
     try:
-        from hermes_cli.models import cached_provider_model_ids, normalize_provider
+        from hermes_cli.models import _load_provider_models_cache, normalize_provider
 
         normalized = normalize_provider(prov) or prov
-        catalog = cached_provider_model_ids(normalized)
-        if not catalog:
-            return True  # no catalog data — unverifiable, accept
+        cache = _load_provider_models_cache()  # pure disk read; no live fetch, no write
+        entry = cache.get(normalized) if isinstance(cache, dict) else None
+        catalog = entry.get("models") if isinstance(entry, dict) else None
+        if not isinstance(catalog, list) or not catalog:
+            return True  # cold / absent cache — unverifiable, accept
         wanted = model.strip().lower()
-        return any(wanted == entry.strip().lower() for entry in catalog)
+        return any(
+            isinstance(m, str) and wanted == m.strip().lower() for m in catalog
+        )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("model_router: catalog lookup failed for %s:%s — %s", prov, model, exc)
         return True
