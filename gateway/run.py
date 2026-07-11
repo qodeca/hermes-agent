@@ -10996,7 +10996,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
-        
+            # T26: task-complexity model routing, first turn ONLY. Seeds the
+            # sticky override map BEFORE anything resolves this session's
+            # runtime (image-mode decision, hygiene, the agent turn itself),
+            # so the routed model is fixed at conversation start and every
+            # later turn reads the seeded override instead of re-routing —
+            # per-conversation prompt caching stays byte-stable. Fail-open
+            # and config-gated (routing.enabled, off by default).
+            await asyncio.to_thread(
+                self._maybe_route_session_model,
+                session_key=session_key,
+                source=source,
+                task_text=event.text or "",
+                has_attachments=bool(getattr(event, "media_urls", None)),
+            )
+
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
@@ -15991,6 +16005,166 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), provider or "",
         )
+
+    def _maybe_route_session_model(
+        self,
+        *,
+        session_key: str,
+        source: Optional["SessionSource"],
+        task_text: str,
+        user_config: Optional[dict] = None,
+        has_attachments: bool = False,
+    ) -> None:
+        """Seed a task-complexity routed model on a session's FIRST turn (T26).
+
+        Called only when the caller has established this is a new
+        conversation (the ``_is_new_session`` boundary in
+        ``_handle_message_with_agent``). A routed decision is written into
+        the existing ``_session_model_overrides`` sticky map (with a
+        ``routed: True`` marker), so ``_resolve_session_agent_runtime``
+        returns the SAME model on every subsequent turn — the model is fixed
+        at conversation start and never revisited, preserving
+        per-conversation prompt-cache byte-stability. The non-secret parts
+        are written through to the session store exactly like a /model
+        override, so a gateway restart rehydrates the same model instead of
+        reverting the live conversation to the default.
+
+        Precedence (highest first) — the router only fills the
+        global-default gap: session /model override (in-memory or persisted)
+        > channel override > runtime-provider model > router > global config
+        default. Every explicit choice skips routing entirely; a later
+        /model command replaces the routed entry unconditionally.
+
+        Fail-open: config-gated (``routing.enabled``, off by default),
+        guarded import, guarded call — a broken router must never break a
+        gateway session. A routed tier that names its own provider resolves
+        its own credential bundle (mirroring override rehydration); if that
+        fails the route is skipped rather than paired with the default
+        provider's key.
+        """
+        if not session_key:
+            return
+        try:
+            cfg = user_config if isinstance(user_config, dict) else _load_gateway_config()
+            # Cheap short-circuit for the default (routing absent/disabled)
+            # case; route_model below re-validates with strict coercion.
+            if not (cfg.get("routing") or {}):
+                return
+
+            # Sticky map wins: a /model override — or an earlier routed
+            # decision, in-memory or persisted — is never revisited.
+            self._rehydrate_session_model_override(session_key)
+            if session_key in self._session_model_overrides:
+                return
+
+            # Channel overrides pin the channel's model/provider explicitly.
+            gw_cfg = getattr(self, "config", None)
+            if gw_cfg is not None and source is not None:
+                ch = _get_channel_override(
+                    gw_cfg,
+                    source.platform,
+                    str(source.chat_id) if source.chat_id else "",
+                    thread_id=(
+                        str(source.thread_id)
+                        if getattr(source, "thread_id", None)
+                        else None
+                    ),
+                    parent_id=(
+                        str(source.parent_chat_id)
+                        if getattr(source, "parent_chat_id", None)
+                        else None
+                    ),
+                )
+                if ch is not None and (ch.model or ch.provider):
+                    return
+
+            # A runtime provider that bundles its own model is an explicit pin.
+            if _resolve_runtime_agent_kwargs().get("model"):
+                return
+
+            # Guarded import + guarded call: any router failure keeps the
+            # default resolution (outer except).
+            from agent.model_router import RouteContext, route_model
+
+            toolsets: tuple = ()
+            if source is not None:
+                try:
+                    from hermes_cli.tools_config import _get_platform_tools
+
+                    toolsets = tuple(
+                        sorted(
+                            _get_platform_tools(
+                                cfg, _platform_config_key(source.platform)
+                            )
+                        )
+                    )
+                except Exception:
+                    toolsets = ()
+
+            decision = route_model(
+                task_text or "",
+                context=RouteContext(
+                    origin="gateway",
+                    toolsets=toolsets,
+                    has_attachments=bool(has_attachments),
+                ),
+                config=cfg,
+            )
+            if not decision.model:
+                return
+
+            override: Dict[str, Any] = {"model": decision.model, "routed": True}
+            if decision.provider:
+                # The routed tier names its own backend — resolve the full
+                # credential bundle the same way override rehydration does.
+                # Failure skips the route (fail-open) instead of pairing the
+                # routed model with the default provider's credentials.
+                try:
+                    runtime = _resolve_runtime_agent_kwargs_for_provider(
+                        decision.provider
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "model_router: routed provider %r did not resolve for "
+                        "session=%s (%s); keeping default model",
+                        decision.provider, session_key, exc,
+                    )
+                    return
+                override["provider"] = decision.provider
+                override["api_key"] = runtime.get("api_key")
+                override["api_mode"] = runtime.get("api_mode")
+                override["credential_pool"] = runtime.get("credential_pool")
+                override["base_url"] = decision.base_url or runtime.get("base_url")
+            elif decision.base_url:
+                # base_url-only tier: credential-less override; the resolver
+                # falls back to env-based resolution and applies
+                # model/base_url on top (same as a rehydrated override whose
+                # credentials could not be re-resolved).
+                override["base_url"] = decision.base_url
+
+            self._session_model_overrides[session_key] = override
+            # Write-through the non-secret parts so the routed model
+            # survives a gateway restart (same path as /model; the ``routed``
+            # marker and credentials are never persisted).
+            try:
+                self.session_store.set_model_override(session_key, override)
+            except Exception:
+                logger.debug(
+                    "Failed to persist routed session model override",
+                    exc_info=True,
+                )
+            logger.info(
+                "model_router: origin=gateway session=%s tier=%s model=%s "
+                "source=%s reason=%s",
+                session_key, decision.tier, decision.model,
+                decision.source, decision.reason,
+            )
+        except Exception as exc:
+            logger.warning(
+                "model_router: gateway routing failed open for session=%s "
+                "(%s: %s); keeping default model resolution",
+                session_key, type(exc).__name__, exc,
+            )
 
     def _apply_session_model_override(
         self, session_key: str, model: str, runtime_kwargs: dict
