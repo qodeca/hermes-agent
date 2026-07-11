@@ -412,30 +412,46 @@ def _resolve_cron_max_iterations(cfg: dict | None) -> int:
     intent for unattended jobs, so an explicit ``cron.max_iterations``
     takes priority over it.
 
-    An invalid (non-int-convertible) configured value falls back to the
-    default rather than raising, mirroring ``_resolve_cron_max_runtime``.
+    Unlike its config-block neighbors ``max_runtime_seconds`` and
+    ``session_output_token_budget`` — where 0 means "unlimited" — this
+    key has NO unlimited mode: a per-turn cap of 0 (or negative) would
+    make the loop guard ``api_call_count < max_iterations`` false on its
+    very first check (``0 < 0``), so the agent makes ZERO API calls and
+    the job silently does nothing. An operator following the neighbors'
+    ``0 = unlimited`` convention would therefore get a job that never
+    runs. To close that footgun, any configured value that is not a
+    POSITIVE int (``<= 0`` or non-int-convertible) is treated as unset
+    and falls through to the next tier (agent.max_turns → legacy → 40),
+    mirroring ``_resolve_cron_max_runtime``'s bad-value handling. A
+    positive cap always applies.
     """
     _cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
     _cron_cfg = _cron_cfg if isinstance(_cron_cfg, dict) else {}
     _configured = _cron_cfg.get("max_iterations")
     if _configured is not None:
         try:
-            return int(_configured)
+            _val = int(_configured)
         except (TypeError, ValueError):
-            logger.warning(
-                "Invalid cron.max_iterations=%r in config; using default %d",
-                _configured, _DEFAULT_CRON_MAX_ITERATIONS,
-            )
-            return _DEFAULT_CRON_MAX_ITERATIONS
+            _val = 0
+        if _val > 0:
+            return _val
+        logger.warning(
+            "Ignoring non-positive/invalid cron.max_iterations=%r "
+            "(no 'unlimited' mode for this key — 0 would run zero turns); "
+            "falling back to agent.max_turns or default %d",
+            _configured, _DEFAULT_CRON_MAX_ITERATIONS,
+        )
 
     _agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
     _agent_cfg = _agent_cfg if isinstance(_agent_cfg, dict) else {}
     _fallback = _agent_cfg.get("max_turns") or (cfg.get("max_turns") if isinstance(cfg, dict) else None)
     if _fallback:
         try:
-            return int(_fallback)
+            _fb = int(_fallback)
         except (TypeError, ValueError):
-            pass
+            _fb = 0
+        if _fb > 0:
+            return _fb
 
     return _DEFAULT_CRON_MAX_ITERATIONS
 

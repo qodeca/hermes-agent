@@ -72,6 +72,32 @@ class TestResolution:
         cfg = {"cron": {"max_iterations": "lots"}}
         assert _resolve_cron_max_iterations(cfg) == 40
 
+    def test_zero_cron_value_falls_back_not_a_zero_cap(self):
+        """A configured 0 must NOT produce a zero-turn job (0 < 0 is
+        False on the loop's first check → the agent makes ZERO API
+        calls and silently does nothing). Unlike max_runtime_seconds /
+        session_output_token_budget, this key has no 'unlimited' mode:
+        a non-positive value is treated as unset and falls through to
+        the next tier (here: the 40 default)."""
+        cfg = {"cron": {"max_iterations": 0}}
+        assert _resolve_cron_max_iterations(cfg) == 40
+
+    def test_negative_cron_value_falls_back(self):
+        cfg = {"cron": {"max_iterations": -5}}
+        assert _resolve_cron_max_iterations(cfg) == 40
+
+    def test_zero_cron_value_falls_back_to_agent_max_turns(self):
+        """Non-positive cron value is unset → the next tier (agent.max_turns)
+        governs, not the 40 default."""
+        cfg = {"agent": {"max_turns": 120}, "cron": {"max_iterations": 0}}
+        assert _resolve_cron_max_iterations(cfg) == 120
+
+    def test_positive_cron_value_still_wins_after_the_guard(self):
+        """The non-positive guard must not regress the happy path: a
+        positive cron key still takes priority over agent.max_turns."""
+        cfg = {"agent": {"max_turns": 120}, "cron": {"max_iterations": 25}}
+        assert _resolve_cron_max_iterations(cfg) == 25
+
     def test_non_dict_cfg_uses_default(self):
         assert _resolve_cron_max_iterations({"cron": "not-a-dict"}) == 40
 

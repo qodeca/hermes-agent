@@ -2783,6 +2783,11 @@ DEFAULT_CONFIG = {
         # depth, and max_runtime_seconds (above) and
         # session_output_token_budget (below) are the actual brakes on a
         # runaway job; this cap is the third rail, not the primary limit.
+        # Unlike those two neighbors, this key has NO "unlimited" mode: a
+        # per-turn cap of 0 would run ZERO turns (the loop guard
+        # api_call_count < max_iterations is 0 < 0 = false immediately),
+        # so a non-positive value is ignored and the resolver falls back
+        # to agent.max_turns, then 40. A positive cap always applies.
         # Default 40.
         "max_iterations": 40,
         # Session output-token budget for CRON sessions — a lower default
