@@ -657,13 +657,45 @@ def run_conversation(
     # been granted its one wrap-up call after the budget tripped.
     output_budget_grace_granted = False
     # Degeneration detection state (see the top-of-loop check): count of
-    # CONSECUTIVE degenerate assistant messages, the one-shot pending
-    # steer note, and the index of the newest assistant message already
-    # scored — primed from pre-turn history so a stale assistant message
-    # from an earlier turn is never scored as this turn's output.
+    # CONSECUTIVE degenerate assistant messages and the one-shot pending
+    # steer note.
+    #
+    # "Already scored" is tracked with a per-message marker
+    # (``msg["_degen_scored"]``) rather than a positional index into
+    # ``messages``. A positional index breaks because several seams
+    # mid-loop rebind the local ``messages`` variable to a brand-new list
+    # rather than mutating it in place — context compression
+    # (~1173/3350/3606/3830/5026) and the content-filter rollback
+    # (~2016) — AND, critically, ``ContextCompressor.compress()`` always
+    # runs every message (including the "protected" tail) through
+    # ``_prune_old_tool_results()``, which does ``[m.copy() for m in
+    # messages]``: even an untouched tail message gets a NEW dict object.
+    # So neither a positional index nor plain object/``id()`` identity on
+    # the message dict survives compression — a copy is indistinguishable
+    # from "genuinely new" by either measure, and using either would
+    # either re-score an already-scored message into a spurious second
+    # strike (the reported bug), or, when a rebind lands BEFORE the
+    # top-of-loop check ever sees a just-appended message — e.g. the
+    # post-response compression call at ~5057, which can fire before this
+    # loop next reaches the top — silently skip scoring it forever.
+    #
+    # A marker key sidesteps both failure modes: ``dict.copy()`` preserves
+    # arbitrary keys, so it survives compression's copy along with the
+    # message; a genuinely new assistant message parsed fresh from an API
+    # response never carries it. This is the same pattern already used for
+    # ``_thinking_prefill`` et al. (see ``_EPHEMERAL_SCAFFOLDING_FLAGS`` in
+    # run_agent.py) — stripped from the outbound API copy at the
+    # ``_thinking_prefill`` pop site below, never sent over the wire.
+    #
+    # Priming: stamp whatever is the newest assistant message at TURN
+    # START (if any) as already-scored, so a stale assistant message left
+    # over from an earlier turn (or a resumed session) is never scored as
+    # this turn's own output.
     degen_strikes = 0
     degen_steer_pending = False
-    degen_last_scored_idx = newest_assistant_index(messages)
+    _degen_prior_idx = newest_assistant_index(messages)
+    if _degen_prior_idx is not None:
+        messages[_degen_prior_idx]["_degen_scored"] = True
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
@@ -763,24 +795,30 @@ def run_conversation(
         # sessions; cron sessions default true via the scheduler).
         if getattr(agent, "_degeneration_detection", False):
             _degen_newest_idx = newest_assistant_index(messages)
-            if _degen_newest_idx is not None and _degen_newest_idx != degen_last_scored_idx:
-                degen_last_scored_idx = _degen_newest_idx
-                _degen_newest_text = messages[_degen_newest_idx].get("content")
-                if isinstance(_degen_newest_text, str) and _degen_newest_text.strip():
-                    _degen_reason = looks_degenerate(recent_assistant_texts(messages))
-                    if _degen_reason:
-                        degen_strikes += 1
-                        if degen_strikes >= 2:
-                            _turn_exit_reason = "degeneration_detected"
-                            if not agent.quiet_mode:
-                                agent._safe_print(
-                                    f"\n⚠️  Degenerating repetition loop detected "
-                                    f"({_degen_reason}) — ending the turn"
-                                )
-                            break
-                        degen_steer_pending = True
-                    else:
-                        degen_strikes = 0
+            if _degen_newest_idx is not None:
+                _degen_newest_msg = messages[_degen_newest_idx]
+                if not _degen_newest_msg.get("_degen_scored"):
+                    # Mark scored FIRST (not after computing the verdict):
+                    # this message must never be scored a second time no
+                    # matter what happens next, including a mid-turn
+                    # compression/rollback rebind that follows immediately.
+                    _degen_newest_msg["_degen_scored"] = True
+                    _degen_newest_text = _degen_newest_msg.get("content")
+                    if isinstance(_degen_newest_text, str) and _degen_newest_text.strip():
+                        _degen_reason = looks_degenerate(recent_assistant_texts(messages))
+                        if _degen_reason:
+                            degen_strikes += 1
+                            if degen_strikes >= 2:
+                                _turn_exit_reason = "degeneration_detected"
+                                if not agent.quiet_mode:
+                                    agent._safe_print(
+                                        f"\n⚠️  Degenerating repetition loop detected "
+                                        f"({_degen_reason}) — ending the turn"
+                                    )
+                                break
+                            degen_steer_pending = True
+                        else:
+                            degen_strikes = 0
             if (
                 degen_steer_pending
                 and messages
@@ -963,6 +1001,10 @@ def run_conversation(
                 api_msg.pop("finish_reason")
             # Strip internal thinking-prefill marker
             api_msg.pop("_thinking_prefill", None)
+            # Strip internal degeneration-detector "already scored" marker
+            # (see where degen_strikes is initialized) — bookkeeping only,
+            # never meant for the wire.
+            api_msg.pop("_degen_scored", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields

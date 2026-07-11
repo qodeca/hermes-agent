@@ -315,6 +315,108 @@ def test_detection_off_by_default_no_intervention(agent_env):
             assert STEER_MARKER not in m["content"]
 
 
+# ── mid-turn ``messages`` rebind (compression / rollback) robustness ────
+
+def test_compression_rebind_does_not_double_count_scored_strike(agent_env, monkeypatch):
+    """A mid-turn context-compression rebind of ``messages`` must not
+    double-count an already-scored strike into a spurious second strike.
+
+    Simulates the rebind at the REAL seam the production loop uses —
+    ``agent.context_compressor.should_compress()`` gating
+    ``agent._compress_context()`` in the pre-API pressure check
+    (agent/conversation_loop.py) — rather than forcing a real compression
+    (which would need a huge synthetic transcript + a real/aux LLM
+    summarizer call). ``should_compress`` is forced True for exactly the
+    pre-API check that runs right after strike 1 is registered; the stand-in
+    ``_compress_context`` returns a brand-new list object (as real
+    compression always does) with an extra spliced-in turn near the head,
+    so every tail index shifts — reproducing the positional-index mismatch
+    that trips the pre-fix bug — while leaving the just-scored assistant+
+    tool tail content untouched, mirroring how real compression's
+    ``_prune_old_tool_results`` still emits fresh dict copies for
+    unchanged/protected tail messages.
+
+    Pre-fix (positional-index tracking), this rebind makes the top-of-loop
+    check re-score the SAME strike-1 message as if it were new, producing a
+    spurious strike 2 and a `degeneration_detected` exit that starves the
+    model of its steered recovery call. Post-fix, the already-scored
+    message is recognized (via its "_degen_scored" marker, which survives
+    the copy) and is not rescored, so the model gets its real second call.
+    """
+    make_agent, handler = agent_env
+    agent = make_agent()
+    agent._degeneration_detection = True
+    handler.response_queue = [
+        # Call 1: degenerate -> strike 1 (steered).
+        _tc_resp("read_file", '{"file_path": "/nonexistent_hermes_degen"}', content=DEGENERATE_TEXT),
+        # Call 2: the steered recovery call. If the rebind bug re-scores
+        # strike 1 as a spurious strike 2, this response is never fetched.
+        _text_resp("Hello Marcin! (final answer, delivered once)"),
+    ]
+
+    should_compress_calls = {"n": 0}
+
+    def _fake_should_compress(_tokens=None):
+        should_compress_calls["n"] += 1
+        # Invocation #1: the pre-API check ahead of call 1 — don't compress
+        # yet (call 1 must go out for real to produce strike 1).
+        # Invocation #2: the pre-API check ahead of call 2, AFTER strike 1
+        # was scored by the top-of-loop check for this iteration — force
+        # the rebind here, exactly between strike-1 scoring and call 2.
+        return should_compress_calls["n"] == 2
+
+    compress_calls = {"n": 0}
+
+    def _fake_compress_context(compress_messages, system_message, **kwargs):
+        compress_calls["n"] += 1
+        # Real compression rewrites/shrinks the head and returns a NEW list
+        # object while the live tail survives (content-wise) — splice a
+        # placeholder "compacted" exchange right after the system message so
+        # every tail index shifts, then return copies of the rest so no
+        # message keeps its old object identity either (matching
+        # ContextCompressor._prune_old_tool_results' unconditional
+        # ``[m.copy() for m in messages]``).
+        new_messages = (
+            compress_messages[:1]
+            + [
+                {"role": "user", "content": "[compacted summary placeholder]"},
+                {"role": "assistant", "content": "Acknowledged."},
+            ]
+            + [dict(m) for m in compress_messages[1:]]
+        )
+        return new_messages, system_message
+
+    monkeypatch.setattr(agent.context_compressor, "should_compress", _fake_should_compress)
+    monkeypatch.setattr(agent, "_compress_context", _fake_compress_context)
+
+    result = agent.run_conversation("hello", conversation_history=[], task_id="t")
+
+    # The compression seam actually fired once — this exercises the real
+    # rebind path, not a bypassed/mocked-out one.
+    assert compress_calls["n"] == 1
+
+    # The turn must NOT have exited on a spurious second strike: the model
+    # got its real steered recovery call (call 2) and the turn completed
+    # normally.
+    assert len(handler.captured_requests) == 2
+    assert result["turn_exit_reason"] != "degeneration_detected"
+    assert str(result["turn_exit_reason"]).startswith("text_response")
+    assert "final answer" in (result["final_response"] or "")
+
+    # The recovery request carried the steering note from strike 1 — proof
+    # the strike WAS registered (not silently dropped by a naive rebind
+    # reset), it just wasn't double-counted.
+    tool_msgs = _tool_messages(handler.captured_requests[1])
+    assert tool_msgs and STEER_MARKER in tool_msgs[-1]["content"]
+
+    # The internal scoring marker never leaked onto the wire.
+    for req in handler.captured_requests:
+        for m in req["messages"]:
+            assert "_degen_scored" not in m
+
+    _assert_valid_transcript(result["messages"])
+
+
 # ── config wiring ────────────────────────────────────────────────────────
 
 def test_degeneration_detection_config_wiring(agent_env):
