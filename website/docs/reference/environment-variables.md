@@ -482,7 +482,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `GATEWAY_PROXY_KEY` | Bearer token for authenticating with the remote API server in proxy mode. Must match `API_SERVER_KEY` on the remote host. |
 | `MESSAGING_CWD` | Deprecated compatibility fallback for gateway working directory. Prefer `terminal.cwd` in `config.yaml`. |
 | `GATEWAY_ALLOWED_USERS` | Comma-separated user IDs allowed across all platforms |
-| `GATEWAY_ALLOW_ALL_USERS` | Allow all users without allowlists (`true`/`false`, default: `false`) |
+| `GATEWAY_ALLOW_ALL_USERS` | Allow all users without allowlists (`true`/`false`, default: `false`). Deprecated — prefer per-platform `<PLATFORM>_ALLOW_ALL_USERS`; any active allow-all logs a startup WARNING and (when `alerts.deliver` is set) an operator alert. |
 
 ### Web Dashboard & Hermes Desktop
 

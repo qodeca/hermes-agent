@@ -16,7 +16,7 @@ This page is about choosing *which model* handles a task based on its complexity
 The router **never overrides an explicit model choice**. Resolution precedence, highest first:
 
 1. Explicit per-job / per-call model (e.g. a cron job's pinned `provider`/`model`, a `delegate_task` override)
-2. `HERMES_INFERENCE_MODEL` env override
+2. `HERMES_MODEL` / `HERMES_INFERENCE_MODEL` env override (which applies depends on the surface — cron reads `HERMES_MODEL`, one-shot reads `HERMES_INFERENCE_MODEL`, delegation honours either)
 3. Session `/model` switch or channel override
 4. **The router** (only when enabled and the task's origin is in `apply_to`)
 5. Global default from `hermes model`

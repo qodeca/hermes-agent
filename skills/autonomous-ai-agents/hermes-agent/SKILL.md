@@ -327,7 +327,7 @@ The registry of record is `hermes_cli/commands.py` — every consumer
 /approve             Approve a pending command (gateway)
 /deny                Deny a pending command (gateway)
 /allowlist show      Show effective authorization sources – env/group allowlists,
-                     pairing, allow-all flags (admin-gated, gateway)
+                     pairing, allow-all flags (both surfaces; admin-gated on messaging)
 /restart             Restart gateway (gateway)
 /sethome             Set current chat as home channel (gateway)
 /update              Update Hermes to latest (gateway)

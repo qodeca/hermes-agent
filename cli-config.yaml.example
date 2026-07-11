@@ -852,7 +852,7 @@ agent:
 # See agent/model_router.py for the decision logic.
 #
 # Precedence (highest first) — the router never overrides an explicit
-# choice: explicit per-job/per-call model > HERMES_MODEL env > session
+# choice: explicit per-job/per-call model > HERMES_MODEL / HERMES_INFERENCE_MODEL env > session
 # /model or channel override > router > global default.
 #
 # An empty tier model means "keep the existing resolution" for that tier,

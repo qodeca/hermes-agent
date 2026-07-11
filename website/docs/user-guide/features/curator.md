@@ -47,7 +47,7 @@ Because the review fork runs unattended, two guardrails bound what a misbehaving
 - **Denial breaker.** A background review that keeps attempting privileged operations it isn't allowed — counting both whitelist blocks and in-tool guard refusals — is aborted after 5 denied attempts (default), and one [operator alert](/user-guide/features/alerts) is emitted so you know a run was cut short. The counter is currently per-run: a fresh run starts at zero.
 - **Injection scan on curator writes.** Every curator-originated memory or skill write (memory add/replace/batch, skill create/edit/patch/write file) is scanned for prompt-injection patterns before it is persisted. A hit drops the write, logs a WARNING, and counts toward the denial breaker. The scan only applies to background-review writes — skills and memories you create interactively are unaffected.
 
-Both guardrails are about limiting blast radius, not detection theatre: the worst case of a fully compromised review pass remains an aborted run plus an alert, never silently persisted skill/memory content.
+Both guardrails are about limiting blast radius, not perfect detection: the scan is pattern-based, so it stops writes matching a known injection pattern rather than guaranteeing nothing malicious ever persists, and repeated denied attempts abort the run with an alert instead of letting a review hammer the authorization boundary unbounded.
 
 ## Configuration
 
