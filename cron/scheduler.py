@@ -380,6 +380,66 @@ def _resolve_cron_degeneration_detection(cfg: dict | None) -> Optional[bool]:
     return bool(_configured)
 
 
+_DEFAULT_CRON_MAX_ITERATIONS = 40
+
+
+def _resolve_cron_max_iterations(cfg: dict | None) -> int:
+    """Resolve the per-turn iteration cap for a cron job's agent.
+
+    Cron sessions default to a LOWER max_iterations than interactive
+    sessions (40 vs the historical 90) — a confused/looping model given 90
+    turns runs unattended for a long time before anything else notices.
+    40, not a tighter number like 15: legitimate research jobs need real
+    tool-call depth, and the wall-clock cap (``_resolve_cron_max_runtime``,
+    T4) and the session output-token budget
+    (``_resolve_cron_session_output_budget``, T23) are the actual brakes on
+    a runaway job — this cap is the third rail, not the primary limit.
+
+    Resolution order: per-job override (future — no per-job key exists yet;
+    this is a seam for one, not a promise it's read here) >
+    ``cron.max_iterations`` config > global ``agent.max_turns`` (or the
+    legacy root-level ``max_turns``, since the raw config this resolver
+    reads — ``yaml.safe_load`` of config.yaml — never passes through the
+    ``agent.max_turns`` normalization pipeline that ``load_config()``
+    applies) > 40 default.
+
+    Note this precedence is the OPPOSITE of
+    ``_resolve_cron_session_output_budget`` / ``_resolve_cron_degeneration_detection``,
+    where the agent-level key always wins: those keys default OFF for
+    interactive sessions and cron opts them ON, so an explicit agent-level
+    choice must be honored. ``agent.max_turns`` instead already has a
+    real interactive default (90) that says nothing about an operator's
+    intent for unattended jobs, so an explicit ``cron.max_iterations``
+    takes priority over it.
+
+    An invalid (non-int-convertible) configured value falls back to the
+    default rather than raising, mirroring ``_resolve_cron_max_runtime``.
+    """
+    _cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    _cron_cfg = _cron_cfg if isinstance(_cron_cfg, dict) else {}
+    _configured = _cron_cfg.get("max_iterations")
+    if _configured is not None:
+        try:
+            return int(_configured)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid cron.max_iterations=%r in config; using default %d",
+                _configured, _DEFAULT_CRON_MAX_ITERATIONS,
+            )
+            return _DEFAULT_CRON_MAX_ITERATIONS
+
+    _agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+    _agent_cfg = _agent_cfg if isinstance(_agent_cfg, dict) else {}
+    _fallback = _agent_cfg.get("max_turns") or (cfg.get("max_turns") if isinstance(cfg, dict) else None)
+    if _fallback:
+        try:
+            return int(_fallback)
+        except (TypeError, ValueError):
+            pass
+
+    return _DEFAULT_CRON_MAX_ITERATIONS
+
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
@@ -3210,8 +3270,10 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Max iterations: cron sessions default LOWER than interactive ones
+        # (40 vs 90) — see _resolve_cron_max_iterations for the resolution
+        # order and rationale (T28).
+        max_iterations = _resolve_cron_max_iterations(_cfg)
 
         # Session output-token budget: cron sessions get a lower default
         # than interactive ones (an unattended runaway job once produced

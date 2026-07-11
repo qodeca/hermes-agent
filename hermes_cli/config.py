@@ -2771,6 +2771,20 @@ DEFAULT_CONFIG = {
         # negative disables the cap (unlimited — the inactivity timeout is
         # then the only bound). Default 3600 (1 hour).
         "max_runtime_seconds": 3600,
+        # Per-turn iteration cap for CRON sessions — a lower default than
+        # interactive sessions (agent.max_turns, default 90) because a
+        # confused/looping unattended job otherwise gets a very long rope.
+        # Takes priority over agent.max_turns when set (the opposite
+        # precedence from session_output_token_budget/degeneration_detection
+        # below, which defer to an explicit agent-level key): max_turns'
+        # interactive default says nothing about intent for unattended
+        # jobs, so an explicit cron.max_iterations wins. 40, not a tighter
+        # number like 15 — legitimate research jobs need real tool-call
+        # depth, and max_runtime_seconds (above) and
+        # session_output_token_budget (below) are the actual brakes on a
+        # runaway job; this cap is the third rail, not the primary limit.
+        # Default 40.
+        "max_iterations": 40,
         # Session output-token budget for CRON sessions — a lower default
         # than interactive sessions because a runaway scheduled job burns
         # unattended (an incident: 261 KB of looping self-deliberation for
