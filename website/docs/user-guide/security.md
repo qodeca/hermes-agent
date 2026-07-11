@@ -355,6 +355,22 @@ restart the container — the entrypoint will fix ownership on the next start.
 - `{platform}-approved.json` — approved users
 - `_rate_limits.json` — rate limit and lockout tracking
 
+### Inspecting effective authorization (`/allowlist show`)
+
+With this many layered sources, it can be hard to answer "who can actually talk to this bot right now?". The `/allowlist show` slash command reports every effective authorization source in one place: per-platform env allowlists, group allowlists, the bot policy, paired users, and any active allow-all flags.
+
+On messaging platforms the command is **admin-gated** — it requires `policy.enabled` and `policy.is_admin(user_id)` for the caller. The local interactive CLI path is ungated (you already own the machine).
+
+### Security audit severity and operator alerting
+
+The startup security audit classifies each finding with a severity. Two findings are rated `high`: SSH password authentication enabled, and a network listener running without authentication. When any high-severity finding is present, Hermes emits **one combined [operator alert](/user-guide/features/alerts)** to the `alerts.deliver` target (if configured) in addition to the unchanged log lines — so a headless gateway can't silently boot in a risky configuration. An active allow-all flag (per-platform or global) likewise triggers a startup operator alert listing the open platforms.
+
+The audit never fails closed — findings warn and alert, they don't block startup.
+
+### Restart guard (process ancestry)
+
+`hermes gateway restart` and `hermes gateway stop` refuse to run when invoked *from inside* the gateway they would kill — a self-restart from an agent-driven terminal command would orphan the very run executing it. The guard trips when the `_HERMES_GATEWAY` environment variable is set **or** the caller's process ancestry contains the recorded gateway PID (`~/.hermes/gateway.pid`). Any error during the ancestry walk falls back to the env-var check alone, so the guard degrades safely rather than blocking legitimate restarts.
+
 ## Container Isolation
 
 When using the `docker` terminal backend, Hermes applies strict security hardening to every container.

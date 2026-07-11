@@ -84,6 +84,8 @@ const sidebars: SidebarsConfig = {
           items: [
             'user-guide/features/cron',
             'reference/automation-blueprints-catalog',
+            'user-guide/features/alerts',
+            'user-guide/features/model-router',
             'user-guide/features/delegation',
             'user-guide/features/kanban',
             'user-guide/features/codex-app-server-runtime',

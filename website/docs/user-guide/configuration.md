@@ -839,6 +839,23 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
+## Agent Loop Guardrails
+
+Additional `agent.*` keys bound how far a single session can run when things go wrong:
+
+```yaml
+agent:
+  max_consecutive_api_failures: 10   # circuit breaker on consecutive backend failures (0 = disabled)
+  session_output_token_budget: 0     # cumulative output-token budget per session (0 = unlimited)
+  degeneration_detection: false      # repetition detector for interactive sessions (off by default)
+  default_max_tokens: 0              # per-call max_tokens when agent.max_tokens is unset (0 = provider default)
+```
+
+- `agent.max_consecutive_api_failures` (default `10`) — circuit breaker: aborts the conversation loop after N consecutive backend API failures. The count carries across provider-fallback resets and resets to `0` on any successful call. Set `0` to disable.
+- `agent.session_output_token_budget` (default `0`, off) — cumulative output-token budget for one session. When exceeded, the loop ends cleanly via a final grace call instead of dying mid-thought. Cron runs have their own, lower default — see [Cron](#cron) below.
+- `agent.degeneration_detection` (default `false`) — repetition/degeneration detector for **interactive** sessions. Off by default because interactive users see and stop loops themselves; the unattended cron surface enables it via `cron.degeneration_detection` instead. When set explicitly, this key wins everywhere.
+- `agent.default_max_tokens` (default `0`) — the per-call `max_tokens` sent when `agent.max_tokens` is unset. `0` leaves the value to the provider default.
+
 ## Standing Goals (`/goal`)
 
 When a standing goal is active, Hermes judges whether each assistant response satisfies it. If not, it feeds a continuation prompt back into the same session and keeps working until the goal is done, the turn budget is exhausted, or the user pauses/clears it. The turn budget is the real backstop — judge failures fail **open** (continue) so a flaky judge never wedges progress.
@@ -1945,6 +1962,60 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 **Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
 
 **Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
+
+## Cron
+
+Limits and budgets for scheduled runs. See [Scheduled Tasks (Cron) → Run limits and budgets](/user-guide/features/cron#run-limits-and-budgets) for the full behaviour:
+
+```yaml
+cron:
+  max_runtime_seconds: 3600            # wall-clock cap per run, regardless of activity (0 = unlimited)
+  max_iterations: 40                   # agent-loop iteration cap for cron runs
+  session_output_token_budget: 200000  # cumulative output-token budget per cron run
+  output_max_bytes: 262144             # byte cap on a run's stored output file
+  degeneration_detection: true         # repetition detector — on by default for cron
+```
+
+- `cron.max_runtime_seconds` (default `3600`) — wall-clock runtime cap per cron run, regardless of activity; `0` = unlimited. The `HERMES_CRON_MAX_RUNTIME` env var wins over this key. Pairs with the `HERMES_CRON_TIMEOUT` inactivity timeout (default `600` s, resets on activity) — whichever trips first ends the run.
+- `cron.max_iterations` (default `40`) — cron agent-loop iteration cap. Falls back to `agent.max_turns`, then the built-in `40`; non-positive values are treated as unset, not unlimited.
+- `cron.session_output_token_budget` (default `200000`) — output-token budget applied to cron sessions (lower than interactive; cron runs are single-shot).
+- `cron.output_max_bytes` (default `262144`) — byte cap on a single run's **stored** output file (head and tail kept, middle elided with a marker). Delivered chat text is separate.
+- `cron.degeneration_detection` (default `true`) — the degeneration detector is on for cron, the unattended surface. An explicit `agent.degeneration_detection` setting wins.
+
+## Model Router
+
+The optional task-complexity model router picks a model **tier** (light / standard / heavy) per task on unattended surfaces. **Off by default** — and even when enabled it only fills the global-default gap: any explicitly pinned model or backend always wins. See [Model Router](/user-guide/features/model-router) for the full feature:
+
+```yaml
+routing:
+  enabled: false                # off by default
+  apply_to: [cron, delegate]    # surfaces: cron, delegate, gateway, oneshot
+  classifier: heuristic         # heuristic | llm | off
+  default_tier: standard
+  tiers:
+    light:    {provider: "", model: "", base_url: ""}
+    standard: {provider: "", model: "", base_url: ""}
+    heavy:    {provider: "", model: "", base_url: ""}
+  heuristics:
+    light_max_chars: 280        # task text ≤ this many chars reads as light
+    heavy_min_chars: 4000       # task text ≥ this many chars reads as heavy
+    light_keywords: [remind, greet, ping, notify, send a message]
+    heavy_keywords: [research, investigate, comprehensive, deep dive, migrate, refactor, crawl]
+    heavy_toolsets: [browser, delegation]   # toolsets that mark a task heavy outright
+```
+
+A tier with all fields empty is a no-op for that tier — the router keeps the existing model resolution. The optional LLM tie-break classifier is configured under `auxiliary.routing` (same shape as `auxiliary.compression`: `provider`, `model`, `base_url`, `api_key`, `timeout`, `extra_body`). Not to be confused with [Provider Routing](/user-guide/features/provider-routing), which selects OpenRouter upstream providers for a fixed model.
+
+## Operator Alerts
+
+Route out-of-band operational warnings (cron runs interrupted by a restart, high-severity security-audit findings, curator denial-breaker aborts) to a chat you watch:
+
+```yaml
+alerts:
+  deliver: ""    # platform:chat_id, e.g. "telegram:123456" — empty = disabled (default)
+```
+
+`alerts.deliver` takes the same target format cron `deliver` accepts. Alerts are fire-and-forget, never raise, and identical titles are rate-limited to one per 15 minutes. See [Operator Alerts](/user-guide/features/alerts).
 
 ## Clarify
 

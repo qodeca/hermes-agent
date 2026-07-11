@@ -225,6 +225,22 @@ On each tick Hermes:
 
 A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks from double-running the same job batch.
 
+### Restart recovery (orphaned runs)
+
+When a recurring job fires, the scheduler stamps a durable `running_marker` on the job record (and sets `last_status: "running"`). If the gateway is restarted or crashes mid-run, that run can never complete — so at boot the built-in scheduler runs a **startup reconciliation** pass: any job whose marker is TTL-expired, or was stamped by this same host, is marked `error` with the message `interrupted: scheduler restarted mid-run`, and one [operator alert](/user-guide/features/alerts) is emitted per reconciled job. Nothing fails silently across a restart.
+
+Reconciliation is scoped by the `HERMES_MACHINE_ID` environment variable (default: `host:pid`-derived). If you run more than one Hermes instance on the same host, set distinct `HERMES_MACHINE_ID` values so restarting one instance doesn't reap the other's live runs.
+
+### Missed slots (`misfire_deadline_seconds`)
+
+By default, a recurring job that misses its scheduled slot (gateway down, machine asleep) fires **once** when the scheduler comes back, then fast-forwards to the next future slot. For jobs where a late run is worse than no run — a "7am market open" brief delivered at 3pm — set the opt-in per-job field `misfire_deadline_seconds`: when the job misses its slot by more than that many seconds, the fire is **skipped** instead. The schedule still fast-forwards, the job records `last_status: "skipped_stale"` (rendered with its own yellow label in `hermes cron list`), and a one-line notice is delivered so you know the run was skipped.
+
+The field is settable on create and update; passing `0` on update clears it. Leaving it unset preserves the fire-once-when-late behaviour.
+
+### Run statistics (`last_run_stats`)
+
+Every run persists a `last_run_stats` block on the job record — `started_at`, `ended_at`, `duration_s` (wall-clock), `exec_duration_s` (execution-only), `api_calls`, `output_tokens`, and `exit_reason` — and emits a `cron.run_summary` INFO log line per run, independent of whether delivery succeeded. This is the first place to look when asking "why was last night's run empty/slow/expensive".
+
 ## Delivery options
 
 When scheduling jobs, you specify where the output goes:
@@ -401,9 +417,36 @@ Otherwise, report the issue.
 
 Failed jobs always deliver regardless of the `[SILENT]` marker — only successful runs can be silenced. For quiet monitoring jobs, prompt the agent to reply with only `[SILENT]` when there is nothing to report.
 
+## Run limits and budgets
+
+Agent-driven cron runs are bounded by **two independent time limits** — whichever trips first ends the run:
+
+| Limit | Default | Config | Behaviour |
+|-------|---------|--------|-----------|
+| **Inactivity timeout** | `600` s | `HERMES_CRON_TIMEOUT` (env) | Resets on every tool call and streamed token — only fires after the configured idle period with no activity. `0` = unlimited. |
+| **Wall-clock runtime cap** | `3600` s | `HERMES_CRON_MAX_RUNTIME` (env) or `cron.max_runtime_seconds` (config; env wins) | Bounds the run's total runtime **regardless of activity** — a job that stays busy forever is still cut off. `0` = unlimited. |
+
+The inactivity timeout catches hung runs; the wall-clock cap catches runs that are actively looping. A job can run for hours under the inactivity budget as long as it keeps working, but never past the wall-clock cap.
+
+Beyond time, cron sessions carry their own resource budgets (all in `config.yaml` under `cron:`):
+
+```yaml
+cron:
+  max_runtime_seconds: 3600            # wall-clock cap per run (0 = unlimited; HERMES_CRON_MAX_RUNTIME wins)
+  max_iterations: 40                   # agent-loop iteration cap for cron runs
+  session_output_token_budget: 200000  # cumulative output-token budget per cron run
+  output_max_bytes: 262144             # byte cap on the stored output file per run
+  degeneration_detection: true         # repetition detector — on by default for cron
+```
+
+- `cron.max_iterations` (default `40`) — caps agent-loop iterations for cron runs. Resolution order: `cron.max_iterations` → `agent.max_turns` → the built-in `40`. A non-positive value is treated as unset (falls back down the chain) — it is **not** an "unlimited" mode.
+- `cron.session_output_token_budget` (default `200000`) — cumulative output-token budget for one cron run; deliberately lower than interactive sessions since cron runs are single-shot. On exceed, the run ends cleanly with a final grace call.
+- `cron.output_max_bytes` (default `262144`) — byte cap on a single run's **stored** output file under `~/.hermes/cron/output/`; oversized output keeps the head and tail and elides the middle with a marker. Delivered chat text is unaffected.
+- `cron.degeneration_detection` (default `true`) — the repetition/degeneration detector is **on** for cron sessions (cron is the unattended surface where nobody is watching for loops). An explicit `agent.degeneration_detection` setting, if present, wins.
+
 ## Script timeout
 
-Pre-run scripts (attached via the `script` parameter) have a default timeout of 3600 seconds (1 hour). This bounds the **script only** — skill-based / LLM-driven jobs run on a separate inactivity budget and are not capped by this value. If your scripts need a different limit, you can change it:
+Pre-run scripts (attached via the `script` parameter) have a default timeout of 3600 seconds (1 hour). This bounds the **script only** — skill-based / LLM-driven jobs run on the separate two-limit model above (inactivity + wall-clock) and are not capped by this value. If your scripts need a different limit, you can change it:
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -548,6 +591,10 @@ every 1d     → Every day
 30 8 1 * *      → First of every month at 8:30 AM
 0 0 * * 0       → Every Sunday at midnight
 ```
+
+:::note Date-pinned expressions become one-shots
+A fully date-pinned expression — fixed day-of-month **and** month, e.g. `0 2 10 7 *` — whose next occurrence is within 31 days is stored as a **one-shot** job rather than a recurring one, since "at 2am on July 10" almost always means "once", not "every year". A far-out date-pinned expression stays recurring (a legitimate yearly job), but the create path returns a notice steering one-time runs to an ISO timestamp instead.
+:::
 
 ### ISO timestamps
 

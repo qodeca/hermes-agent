@@ -213,7 +213,32 @@ The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` re
 3. **Config** — `cron.script_timeout_seconds` in `config.yaml` (read via `load_config()`)
 4. **Default** — 3600 seconds (1 hour)
 
-This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
+This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs run under a **two-limit model** — whichever trips first ends the run:
+
+1. **Inactivity timeout** — `HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited. Resets on every tool call and streamed token, so an actively-working job can run for hours; only a run with no activity for the configured period is killed.
+2. **Wall-clock runtime cap** — `HERMES_CRON_MAX_RUNTIME` (env, wins) or `cron.max_runtime_seconds` (config), default 3600s, `0` = unlimited. Bounds total runtime regardless of activity, so a run that keeps busy-looping (or degenerating) is still cut off.
+
+Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
+
+## Running Marker & Startup Reconciliation
+
+At fire time, recurring jobs are stamped with a durable `running_marker` on the job record:
+
+```json
+"running_marker": {"at": "<iso timestamp>", "by": "<machine_id>"}
+```
+
+together with `last_status: "running"`. The marker is separate from the one-shot `run_claim` (compare-and-set claim used for at-most-once firing) and carries no due-skip semantics — it exists purely so a run interrupted by a process death is *observable* afterwards.
+
+On boot, the built-in in-process ticker runs a **startup reconciliation** pass over all jobs: any run whose marker is TTL-expired, **or** whose marker/stale one-shot claim was stamped by this host, is marked `error` with the message `interrupted: scheduler restarted mid-run`, and one operator alert (see `hermes_cli/operator_alerts.py`) is emitted per reconciled job. The own-host scope is derived from `HERMES_MACHINE_ID` (default `host:pid`-based) — multi-instance hosts must set distinct values so one instance's restart doesn't reap another's live runs. The external Chronos provider has its own reconcile path; this section describes the built-in ticker only.
+
+## Misfire Deadline
+
+`misfire_deadline_seconds` is an opt-in per-job field (settable on create and update; `0` on update clears it). When a recurring job misses its slot by more than this many seconds, the fire is **skipped** rather than run late: the schedule fast-forward is kept, the job records `last_status: "skipped_stale"` (rendered distinctly — yellow, own label — in `hermes cron list`), and a one-line notice is delivered. Default (unset) preserves the deliberate fire-once-past-grace behaviour.
+
+## Per-Run Stats
+
+`mark_job_run(stats=...)` persists a `last_run_stats` block per run — `{started_at, ended_at, duration_s, exec_duration_s, api_calls, output_tokens, exit_reason}`, where `duration_s` is wall-clock (`ended_at - started_at`) and `exec_duration_s` is execution-only — and a `cron.run_summary` INFO line is emitted per run independent of delivery.
 
 ### Provider Recovery
 
