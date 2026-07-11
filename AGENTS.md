@@ -238,8 +238,12 @@ hermes-agent/
 ├── hermes_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
 ├── batch_runner.py       # Parallel batch processing
 ├── agent/                # Agent internals (provider adapters, memory, caching, compression, etc.)
+│   ├── model_router.py   # Task-complexity model router — off by default, fail-open (never raises)
+│   └── degeneration_detector.py  # Repetition detector for unattended sessions (two-strike steer-then-abort)
 ├── hermes_cli/           # CLI subcommands, setup wizard, plugins loader, skin engine
+│   └── operator_alerts.py  # send_operator_alert() — fire-and-forget alerts to the alerts.deliver target
 ├── tools/                # Tool implementations — auto-discovered via tools/registry.py
+│   ├── curator_write_guard.py  # Injection scan on curator-originated memory/skill writes
 │   └── environments/     # Terminal backends (local, docker, ssh, modal, daytona, singularity)
 ├── gateway/              # Messaging gateway — run.py + session.py + platforms/
 │   ├── platforms/        # Adapter per platform (telegram, discord, slack, whatsapp,
@@ -368,6 +372,62 @@ while (api_call_count < self.max_iterations and self.iteration_budget.remaining 
 
 Messages follow OpenAI format: `{"role": "system/user/assistant/tool", ...}`.
 Reasoning content is stored in `assistant_msg["reasoning"]`.
+
+### Resilience & guardrails
+
+Independent guards around the loop, mostly aimed at unattended (cron/gateway) runs:
+
+- **Backend-capacity errors abort, never compress:** `FailoverReason.backend_capacity`
+  (`prefill_memory_exceeded`, memory-guard, kv-cache-exceeded) is classified
+  `retryable=False, should_compress=False` — and BEFORE the generic-400 heuristic,
+  so a capacity 400 fails cleanly instead of entering an endless
+  compress-and-resubmit loop.
+- **Request-timeout floor:** model clients are never built without a timeout —
+  the Anthropic client-build sites resolve through `_resolved_api_call_timeout()`
+  (config → `HERMES_API_TIMEOUT` env → 1800s), and non-stream stale timeouts have
+  a finite ceiling even for reasoning models. Prevents a hung request from
+  stalling a run forever.
+- **Conversation circuit breaker:** `agent.max_consecutive_api_failures`
+  (default 10) aborts the loop after N consecutive backend API failures
+  (counts across provider-fallback resets; resets to 0 on any successful call;
+  `0` = disabled) — a dead backend can't burn the whole iteration budget retrying.
+- **Session output-token budget:** `agent.session_output_token_budget`
+  (default 0 = unlimited) caps cumulative output tokens for one session; on
+  exceed, the loop ends cleanly via a final grace call. `agent.default_max_tokens`
+  (default 0 = provider default) sets per-call `max_tokens` when `agent.max_tokens`
+  is unset.
+- **Degeneration detection** (`agent/degeneration_detector.py`): pure
+  `looks_degenerate(recent_texts)` — 8-gram overlap >60% vs the previous 3
+  assistant turns, OR the same normalized line ≥5× in the newest text.
+  Two-strike integration: first strike steers via the next tool result
+  (role-safe), second consecutive strike exits `degeneration_detected`.
+  Off for interactive sessions (`agent.degeneration_detection`, default false —
+  interactive users see and stop loops themselves), on for cron
+  (`cron.degeneration_detection`, default true).
+- **Compression skips a failing backend:** when the summary call itself fails
+  with a backend-capacity/overloaded error (or the trigger was a backend fault),
+  compression aborts and PRESERVES messages instead of a lossy static drop.
+  `auxiliary.compression.provider/model` is the independent-summarizer escape hatch.
+- **Bounded delegation capacity fallback:** when the async pool is full, the
+  inline synchronous run is bounded by `delegation.sync_fallback_timeout_seconds`
+  (default 600); on expiry the children are interrupted, completed-sibling
+  results are salvaged, and a late-returning orphan skips all parent side effects.
+- **MCP reconnect dwell + log rollup:** keepalive-triggered reconnects dwell
+  `_PARKED_RETRY_INTERVAL` (300s) between FAILED cycles (an explicit `/mcp`
+  refresh bypasses); repeated identical failures log the first at WARNING, then
+  DEBUG, then a periodic rollup and one recovery line — a flapping server can't
+  flood the logs.
+- **Operator alerts** (`hermes_cli/operator_alerts.py`):
+  `send_operator_alert(title, body="", *, severity="warning")` — fire-and-forget
+  over the existing cron delivery machinery to the `alerts.deliver` target
+  (`platform:chat_id`, default `""` = off); never raises; 15-minute
+  identical-title rate limit. Consumed by cron startup reconciliation, the
+  security-audit high-severity path, and the curator denial breaker.
+  User docs: `website/docs/user-guide/features/alerts.md`.
+- **Model router** (`agent/model_router.py`): optional task-complexity routing
+  via the top-level `routing` config section — OFF by default, fail-open (never
+  raises, no-op on any error). Full schema and behaviour:
+  `website/docs/user-guide/features/model-router.md`.
 
 ---
 
@@ -546,7 +606,7 @@ registry.register(
 
 Auto-discovery: any `tools/*.py` file with a top-level `registry.register()` call is imported automatically — no manual import list to maintain. Wiring into a toolset is still a deliberate, manual step.
 
-The registry handles schema collection, dispatch, availability checking, and error wrapping. All handlers MUST return a JSON string.
+The registry handles schema collection, dispatch, availability checking, and error wrapping. All handlers MUST return a JSON string. `check_fn` availability results are logged on transitions only (WARNING on True→False, INFO on recovery), not every turn.
 
 **Path references in tool schemas**: If the schema description mentions file paths (e.g. default output directories), use `display_hermes_home()` to make them profile-aware. The schema is generated at import time, which is after `_apply_profile_override()` sets `HERMES_HOME`.
 
@@ -594,7 +654,13 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 `model`, `agent`, `terminal`, `compression`, `display`, `stt`, `tts`,
 `memory`, `security`, `delegation`, `smart_model_routing`, `checkpoints`,
 `auxiliary`, `curator`, `skills`, `gateway`, `logging`, `cron`, `profiles`,
-`plugins`, `honcho`.
+`plugins`, `honcho`, `alerts`, `routing`.
+
+`alerts` holds operator alerting — `deliver: platform:chat_id` (default `""`
+= off). `routing` holds the optional task-complexity model router (off by
+default); schema documented in
+`website/docs/user-guide/features/model-router.md`, with `auxiliary.routing`
+as the optional LLM tie-break classifier backend.
 
 `auxiliary` holds per-task overrides for side-LLM work (curator, vision,
 embedding, title generation, session_search, etc.) — each task can pin
@@ -1039,6 +1105,16 @@ Invariants:
 - `skill_manage(action="delete")` refuses pinned skills; patch/edit/
   write_file/remove_file go through so the agent can keep improving
   pinned skills.
+- **Denial breaker:** a background review aborts after N denied privileged
+  attempts (default 5), counting both whitelist blocks and in-tool guard
+  refusals, and emits one operator alert — a misbehaving review can't hammer
+  guarded surfaces all night. (Known limitation: per-run scope; a cross-run
+  persistent counter is a follow-up.)
+- **Injection scan** (`tools/curator_write_guard.py`): every curator-originated
+  memory/skill write (add/replace/batch, skill create/edit/patch/write_file)
+  is scanned for injection patterns before persistence, gated on
+  `is_background_review()`; a hit drops the write, logs a WARNING, and credits
+  the denial breaker. Interactive writes are unaffected.
 
 Config section (`curator:` in `config.yaml`):
 `enabled`, `interval_hours`, `min_idle_hours`, `stale_after_days`,
@@ -1077,6 +1153,41 @@ Hardening invariants:
   TOTAL runtime of a single job run regardless of activity — the
   backstop for a job stuck actively retrying a slow/hanging backend.
   Both are `0` = unlimited; whichever trips first interrupts the run.
+- **Iteration / output caps:** `cron.max_iterations` (default 40; resolution:
+  per-job (future) > `cron.max_iterations` > `agent.max_turns` (+legacy root
+  `max_turns`) > 40 — non-positive/non-int falls back, it is NOT "unlimited"),
+  `cron.session_output_token_budget` (default 200000, lower than interactive —
+  cron runs are single-shot), `cron.output_max_bytes` (default 262144 — byte cap
+  on a single run's STORED output file, head 60% + tail 30% kept, middle elided;
+  delivered chat text is separate), `cron.degeneration_detection` (default true —
+  cron is the unattended surface; an explicit `agent.degeneration_detection`,
+  if set, wins).
+- **Running marker + startup reconciliation:** recurring jobs stamp
+  `running_marker = {"at": iso, "by": machine_id}` at fire time (separate from
+  the one-shot `run_claim`; no due-skip semantics), plus `last_status="running"`.
+  At boot the built-in in-process ticker marks orphaned runs (TTL-expired OR
+  own-host marker/stale one-shot claim) as `error` "interrupted: scheduler
+  restarted mid-run" and emits one operator alert per reconciled job — a crashed
+  run can no longer look "running" forever. (Distinct from the external Chronos
+  provider's own reconcile.) `HERMES_MACHINE_ID` scopes the reaping (default
+  `host:pid`); set DISTINCT values per instance when running >1 Hermes on one
+  host so a restart of one doesn't reap the other's live runs.
+- **Misfire deadline** (`misfire_deadline_seconds`, opt-in per-job field): a
+  recurring job that misses its slot by more than N seconds is SKIPPED
+  (fast-forward kept, `last_status="skipped_stale"` — rendered distinctly in
+  `hermes cron list` — one-line notice delivered) instead of firing late.
+  Default (unset) preserves the deliberate fire-once-past-grace behaviour;
+  settable on create and update, `0` on update clears it.
+- **Date-pinned cron → one-shot:** a fully date-pinned 5-field expression
+  (fixed day-of-month AND month, e.g. `0 2 10 7 *`) whose next occurrence is
+  ≤31 days away is stored as `kind="once"` (DST-safe naive-base anchoring) —
+  otherwise it would silently become a yearly job. A far-out date-pinned
+  expression stays recurring (legitimate yearly job) but the create path
+  returns a notice steering one-time runs to an ISO timestamp.
+- **Per-run stats:** `last_run_stats` (`started_at`, `ended_at`, `duration_s`
+  wall-clock, `exec_duration_s` execution-only, `api_calls`, `output_tokens`,
+  `exit_reason`) persisted per run via `mark_job_run(stats=...)`; a
+  `cron.run_summary` INFO line is emitted per run independent of delivery.
 - Catchup window: half the job's period, clamped to 120s–2h.
 - Grace window: 120s for one-shot jobs whose fire time was missed.
 - File lock at `~/.hermes/cron/.tick.lock` prevents duplicate ticks
@@ -1158,6 +1269,29 @@ in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
 - `result` — only the final completion message
 - `error` — only the final message when exit code != 0
 - `off` — no watcher messages at all
+
+### Gateway authorization & hardening
+
+- **Per-platform allow-all:** `<PLATFORM>_ALLOW_ALL_USERS` (e.g.
+  `TELEGRAM_ALLOW_ALL_USERS`) replaces reliance on the single global
+  `GATEWAY_ALLOW_ALL_USERS`, which still works but is deprecated (startup
+  WARNING names the per-platform alternative). Any active allow-all triggers
+  a startup operator alert listing the open platforms — an accidentally-open
+  gateway is loudly visible.
+- **Security-audit severity:** startup audit checks return `(severity,
+  message)`; SSH-password-auth and network-listener-without-auth are `high`,
+  and high findings emit ONE combined operator alert. Log lines are unchanged;
+  there is no fail-closed gate.
+- **Restart guard:** `hermes gateway restart`/`stop` refuse if the
+  `_HERMES_GATEWAY` env is set OR the caller's process ancestry contains the
+  recorded gateway pid (`~/.hermes/gateway.pid`) — an agent running inside the
+  gateway can't kill its own host process. Any error in the ancestry walk falls
+  back to the env check.
+- **`/allowlist show`:** admin-gated slash command reporting effective
+  authorization sources (env allowlists per platform, group allowlists, bot
+  policy, paired users, allow-all flags). Requires
+  `policy.enabled and policy.is_admin(user_id)`; the local interactive CLI
+  path is ungated.
 
 ---
 
