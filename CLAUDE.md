@@ -76,7 +76,11 @@ tools/registry.py  (no deps)
 ```
 Tools are auto-discovered — add a file under `tools/` that calls `registry.register()`. Terminal backends (local, docker, ssh, modal, daytona, singularity) live in `tools/environments/`.
 
-**Agent loop:** entirely synchronous, inside `run_conversation()`. Loops while `api_call_count < max_iterations` and budget remains, checking for interrupts each turn. Messages are OpenAI format (`system`/`user`/`assistant`/`tool`); reasoning goes in `assistant_msg["reasoning"]`.
+**Agent loop:** entirely synchronous, inside `run_conversation()`. Loops while `api_call_count < max_iterations` and budget remains, checking for interrupts each turn. Messages are OpenAI format (`system`/`user`/`assistant`/`tool`); reasoning goes in `assistant_msg["reasoning"]`. Guarded by the conversation circuit breaker (`agent.max_consecutive_api_failures`, aborts after consecutive backend failures) and `agent.session_output_token_budget` (cumulative output-token cap per session); `agent/degeneration_detector.py` (`agent.degeneration_detection`) catches repetition loops.
+
+**Model router** (`agent/model_router.py`, off by default via `routing.enabled`): pure task-complexity classifier that picks a model tier for cron/delegate calls.
+
+**Operator alerts** (`hermes_cli/operator_alerts.py`): fire-and-forget notifications over the cron delivery machinery, gated on `alerts.deliver`.
 
 **Slash commands** are defined once in `hermes_cli/commands.py` (`COMMAND_REGISTRY` of `CommandDef`). CLI dispatch, gateway dispatch, `/help`, Telegram menu, Slack routing, and autocomplete all derive from it automatically. To add one: add a `CommandDef`, then a handler branch in `HermesCLI.process_command()` (`cli.py`) and, if gateway-available, in `gateway/run.py`.
 
@@ -88,9 +92,9 @@ Tools are auto-discovered — add a file under `tools/` that calls `registry.reg
 
 **Skills**: `skills/` (bundled, active by default) vs `optional-skills/` (heavy/niche, installed via `hermes skills install`). SKILL.md `description` must be ≤ 60 chars, one sentence, ending with a period.
 
-**Cron** (`cron/jobs.py` + `cron/scheduler.py`): natural-language scheduled jobs with multi-platform delivery; agents schedule via the `cronjob` tool, users via `hermes cron`. Cron sessions are bounded by an inactivity timeout (`HERMES_CRON_TIMEOUT`, default 600s, resets on activity) plus a wall-clock runtime cap (`HERMES_CRON_MAX_RUNTIME` / `cron.max_runtime_seconds`, default 3600s, bounds total runtime regardless of activity).
+**Cron** (`cron/jobs.py` + `cron/scheduler.py`): natural-language scheduled jobs with multi-platform delivery; agents schedule via the `cronjob` tool, users via `hermes cron`. Cron sessions are bounded by an inactivity timeout (`HERMES_CRON_TIMEOUT`, default 600s, resets on activity) plus a wall-clock runtime cap (`HERMES_CRON_MAX_RUNTIME` / `cron.max_runtime_seconds`, default 3600s, bounds total runtime regardless of activity); also covers startup reconciliation of orphaned runs, per-job `misfire_deadline_seconds` (skip a late fire instead of running it stale), and per-run `last_run_stats` persisted on `mark_job_run()`.
 
-**Config vs secrets:** behavioral settings live in `~/.hermes/config.yaml`. `~/.hermes/.env` is for credentials only — do **not** add `HERMES_*` env vars for non-secret config. Logs: `~/.hermes/logs/` (`agent.log`, `errors.log`, `gateway.log`); browse with `hermes logs`.
+**Config vs secrets:** behavioral settings live in `~/.hermes/config.yaml`, including the top-level `alerts` and `routing` sections. `~/.hermes/.env` is for credentials only — do **not** add `HERMES_*` env vars for non-secret config; the one exception is `HERMES_MACHINE_ID`, which scopes cron reap/reconciliation when running >1 instance on a host. Logs: `~/.hermes/logs/` (`agent.log`, `errors.log`, `gateway.log`); browse with `hermes logs`.
 
 ## Testing conventions
 
