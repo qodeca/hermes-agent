@@ -3072,6 +3072,11 @@ def run_job(
     _stats_start_monotonic = time.monotonic()
     _stats_started_at = (job.get("running_marker") or {}).get("at") or _hermes_now().isoformat()
     _stats_exit_reason = "error"
+    # {tier, model, reason} when the task-complexity router (T25) swapped
+    # the model for this fire; recorded on the run-stats entry below for
+    # observability only. Initialized here so the `finally` stats block can
+    # always read it, even when an error precedes the routing point.
+    _route_stats = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
@@ -3409,6 +3414,111 @@ def run_job(
                 f"(or pin the original values to keep them). See #44585."
             )
 
+        # Resolved once here: the router below uses it as a routing signal
+        # and the AIAgent constructor consumes the same value.
+        _enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+
+        # ── Task-complexity model routing (T25) ──────────────────────────
+        # Fill the GLOBAL-DEFAULT gap only: an explicit job.model or a
+        # HERMES_MODEL env override always wins untouched (precedence:
+        # job.model > HERMES_MODEL > router > config default). The router
+        # is config-gated (routing.enabled, off by default) and fail-open —
+        # a broken router must never take down cron.
+        #
+        # Placed AFTER the #44585 drift guard on purpose: the guard
+        # compares the global-default resolution against the creation-time
+        # model_snapshot (fail-closed spend protection) and must never see
+        # the routed model. The route is a deterministic per-fire
+        # recomputation recorded in run stats for observability only —
+        # never snapshotted, never drift-guarded.
+        _explicit_model = bool(str(job.get("model") or "").strip()) or bool(
+            os.getenv("HERMES_MODEL", "").strip()
+        )
+        if not _explicit_model:
+            _route_decision = None
+            try:
+                # Guarded import + guarded call: any router failure keeps
+                # the default resolution.
+                from agent.model_router import RouteContext, route_model
+
+                _job_skills = job.get("skills") or job.get("skill") or ()
+                if isinstance(_job_skills, str):
+                    _job_skills = (_job_skills,)
+                _route_decision = route_model(
+                    str(job.get("prompt") or ""),
+                    context=RouteContext(
+                        origin="cron",
+                        toolsets=tuple(_enabled_toolsets or ()),
+                        skills=tuple(
+                            str(s).strip() for s in _job_skills if str(s).strip()
+                        ),
+                    ),
+                    config=_cfg if isinstance(_cfg, dict) else {},
+                )
+            except Exception as _route_exc:
+                logger.warning(
+                    "Job '%s': model routing unavailable/failed (%s); "
+                    "keeping default model",
+                    job_id, _route_exc,
+                )
+            # A job that pins provider/base_url (but not model) keeps its
+            # pinned backend: a model-only tier still applies on it, but a
+            # decision that names its own backend is skipped rather than
+            # allowed to override an explicit pin.
+            _backend_pinned = bool(str(job.get("provider") or "").strip()) or bool(
+                str(job.get("base_url") or "").strip()
+            )
+            if (
+                _route_decision is not None
+                and _route_decision.model
+                and (_route_decision.provider or _route_decision.base_url)
+                and _backend_pinned
+            ):
+                logger.info(
+                    "model_router: origin=cron job=%s decision names backend "
+                    "%s but job pins provider/base_url; keeping pinned backend",
+                    job_name,
+                    _route_decision.provider or _route_decision.base_url,
+                )
+                _route_decision = None
+            if _route_decision is not None and _route_decision.model:
+                _routed_runtime = runtime
+                if _route_decision.provider or _route_decision.base_url:
+                    # The routed tier names its own backend — resolve the
+                    # full credential bundle the same way an explicit
+                    # job.provider/base_url does. Failure skips the decision
+                    # (fail-open) instead of pairing the routed model with
+                    # the default provider's credentials.
+                    try:
+                        _route_kwargs = {"requested": _route_decision.provider}
+                        if _route_decision.base_url:
+                            _route_kwargs["explicit_base_url"] = _route_decision.base_url
+                        _routed_runtime = resolve_runtime_provider(**_route_kwargs)
+                    except Exception as _route_exc:
+                        _routed_runtime = None
+                        logger.warning(
+                            "Job '%s': routed provider %r did not resolve (%s); "
+                            "keeping default model",
+                            job_id, _route_decision.provider, _route_exc,
+                        )
+                if _routed_runtime is not None:
+                    model = _route_decision.model
+                    runtime = _routed_runtime
+                    _route_stats = {
+                        "tier": _route_decision.tier,
+                        "model": _route_decision.model,
+                        "reason": _route_decision.reason,
+                    }
+                    logger.info(
+                        "model_router: origin=cron job=%s tier=%s model=%s "
+                        "source=%s reason=%s",
+                        job_name,
+                        _route_decision.tier,
+                        _route_decision.model,
+                        _route_decision.source,
+                        _route_decision.reason,
+                    )
+
         fallback_model = get_fallback_chain(_cfg) or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
@@ -3466,7 +3576,7 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+            enabled_toolsets=_enabled_toolsets,
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
@@ -3842,6 +3952,10 @@ def run_job(
                 "output_tokens": getattr(agent, "session_output_tokens", 0) or 0,
                 "exit_reason": _stats_exit_reason,
             }
+            # Router observability (T25): which tier/model this fire ran on
+            # and why. Absent on unrouted fires; NOT a drift-guard input.
+            if _route_stats:
+                agent._cron_run_stats["route"] = _route_stats
 
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
