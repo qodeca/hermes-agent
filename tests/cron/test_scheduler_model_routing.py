@@ -1,4 +1,4 @@
-"""Cron task-complexity model routing (T25).
+"""Cron task-complexity model routing.
 
 ``run_job`` fills the GLOBAL-DEFAULT gap only: when the model precedence
 (job.model > HERMES_MODEL > config.yaml default) resolved from the config
@@ -8,7 +8,7 @@ env override must always win untouched, routing disabled must be a strict
 no-op, and a broken router must never take down cron (fail-open).
 
 Follows the run_job -> AIAgent-constructor assertion pattern from
-tests/cron/test_cron_max_iterations.py (T28): drive the real ``run_job``
+tests/cron/test_cron_max_iterations.py: drive the real ``run_job``
 against a temp HERMES_HOME with a real config.yaml, mock only AIAgent and
 the runtime-provider resolution, and assert the ``model`` kwarg that
 actually reaches the agent.

@@ -2744,7 +2744,11 @@ DEFAULT_CONFIG = {
             "light_keywords": ["remind", "greet", "ping", "notify", "send a message"],
             "heavy_keywords": ["research", "investigate", "comprehensive",
                                "deep dive", "migrate", "refactor", "crawl"],
-            # Toolsets whose presence marks a task heavy outright.
+            # Toolsets whose presence marks a task heavy outright. Gateway
+            # platforms commonly attach "browser", so the default here will
+            # floor most gateway sessions at heavy whenever gateway routing
+            # is enabled — tune this list down for gateway use if that's
+            # not the intended trade-off.
             "heavy_toolsets": ["browser", "delegation"],
         },
     },

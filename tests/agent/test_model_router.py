@@ -130,7 +130,8 @@ class TestHeuristicTiers:
 
     def test_skills_floor_at_standard_when_no_heavy_signal(self):
         # A short greeting would classify light, but attached skills floor
-        # the tier at standard (T25/T26 build against this shape).
+        # the tier at standard (cron/gateway/oneshot integrations all build
+        # against this shape).
         d = route_model(GREETING, context=ctx(skills=("some-skill",)), config=make_config())
         assert d.tier == "standard"
         assert d.model == STANDARD_MODEL
@@ -216,7 +217,9 @@ class TestRoutingApplies:
         assert routing_applies(make_config(apply_to=["gateway"]), " GATEWAY ") is True
 
     def test_non_dict_config_is_false(self):
-        assert routing_applies("not-a-dict", "gateway") is False
+        # Deliberately wrong type to exercise the runtime isinstance() guard
+        # inside routing_applies — silence the static type check accordingly.
+        assert routing_applies("not-a-dict", "gateway") is False  # type: ignore[arg-type]
 
 
 # ─── catalog resolution ──────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-"""Task-complexity routing for oneshot runs (hermes_cli/oneshot.py, T26).
+"""Task-complexity routing for oneshot runs (hermes_cli/oneshot.py).
 
 Precedence (highest first): explicit ``--model`` / HERMES_INFERENCE_MODEL >
 router > config default. The router only fills the global-default gap; it is

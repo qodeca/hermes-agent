@@ -3601,7 +3601,7 @@ class TestCapacityFallbackBound(unittest.TestCase):
 
 
 class TestModelRouting(unittest.TestCase):
-    """T25: task-complexity routing for delegate children.
+    """Task-complexity routing for delegate children.
 
     The router (config-gated, off by default) fills the pure
     parent-inherit gap only: no explicit ``model`` arg and no

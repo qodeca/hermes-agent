@@ -1332,7 +1332,7 @@ def _build_child_agent(
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
         parent_api_key = parent_agent._client_kwargs.get("api_key")
 
-    # ── Task-complexity model routing ────────────────────────────────────
+    # ── Task-complexity model routing ─────────────────────────────────────
     # Fill the pure parent-inherit gap only: an explicit ``model`` arg
     # (delegation.model or an internal caller pin), a delegation
     # provider/base_url override, or an env-pinned model always wins

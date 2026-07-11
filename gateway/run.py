@@ -10996,7 +10996,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
-            # T26: task-complexity model routing, first turn ONLY. Seeds the
+            # Task-complexity model routing, first turn ONLY. Seeds the
             # sticky override map BEFORE anything resolves this session's
             # runtime (image-mode decision, hygiene, the agent turn itself),
             # so the routed model is fixed at conversation start and every
@@ -16015,7 +16015,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_config: Optional[dict] = None,
         has_attachments: bool = False,
     ) -> None:
-        """Seed a task-complexity routed model on a session's FIRST turn (T26).
+        """Seed a task-complexity routed model on a session's FIRST turn.
 
         Called only when the caller has established this is a new
         conversation (the ``_is_new_session`` boundary in

@@ -3072,7 +3072,7 @@ def run_job(
     _stats_start_monotonic = time.monotonic()
     _stats_started_at = (job.get("running_marker") or {}).get("at") or _hermes_now().isoformat()
     _stats_exit_reason = "error"
-    # {tier, model, reason} when the task-complexity router (T25) swapped
+    # {tier, model, reason} when the task-complexity router swapped
     # the model for this fire; recorded on the run-stats entry below for
     # observability only. Initialized here so the `finally` stats block can
     # always read it, even when an error precedes the routing point.
@@ -3418,7 +3418,7 @@ def run_job(
         # and the AIAgent constructor consumes the same value.
         _enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
 
-        # ── Task-complexity model routing (T25) ──────────────────────────
+        # ── Task-complexity model routing ─────────────────────────────────
         # Fill the GLOBAL-DEFAULT gap only: an explicit job.model, a
         # HERMES_MODEL env override, or a pinned job.provider/base_url all
         # win untouched (precedence: explicit model/backend > router >
@@ -3953,7 +3953,7 @@ def run_job(
                 "output_tokens": getattr(agent, "session_output_tokens", 0) or 0,
                 "exit_reason": _stats_exit_reason,
             }
-            # Router observability (T25): which tier/model this fire ran on
+            # Router observability: which tier/model this fire ran on
             # and why. Absent on unrouted fires; NOT a drift-guard input.
             if _route_stats:
                 agent._cron_run_stats["route"] = _route_stats

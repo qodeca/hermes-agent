@@ -1,4 +1,4 @@
-"""First-turn task-complexity routing for gateway sessions (T26).
+"""First-turn task-complexity routing for gateway sessions.
 
 The routed decision is seeded ONCE, on a session's first turn, into the
 existing ``_session_model_overrides`` sticky map (with a ``routed`` marker),
