@@ -1,7 +1,7 @@
 ---
 name: hermes-agent
 description: "Configure, extend, or contribute to Hermes Agent."
-version: 2.3.0
+version: 2.4.0
 author: Hermes Agent + Teknium
 license: MIT
 platforms: [linux, macos, windows]
@@ -326,6 +326,8 @@ The registry of record is `hermes_cli/commands.py` — every consumer
 ```
 /approve             Approve a pending command (gateway)
 /deny                Deny a pending command (gateway)
+/allowlist show      Show effective authorization sources – env/group allowlists,
+                     pairing, allow-all flags (admin-gated, gateway)
 /restart             Restart gateway (gateway)
 /sethome             Set current chat as home channel (gateway)
 /update              Update Hermes to latest (gateway)
@@ -569,6 +571,22 @@ Per-invocation bypass without changing config:
 
 Note: YOLO / `approvals.mode: off` does NOT turn off secret redaction. They are independent.
 
+### Gateway allow-all flags
+
+Per-platform `<PLATFORM>_ALLOW_ALL_USERS` (e.g.
+`TELEGRAM_ALLOW_ALL_USERS`) opens a single platform to all users; any
+active allow-all triggers a startup operator alert naming the open
+platforms. The global `GATEWAY_ALLOW_ALL_USERS` still works but is
+deprecated (a startup warning points to the per-platform form). Audit
+the effective authorization sources with `/allowlist show` (admin-gated).
+
+### Restart guard
+
+`hermes gateway restart` / `hermes gateway stop` refuse to run from
+inside the gateway's own agent session – blocked when `_HERMES_GATEWAY`
+is set or the caller's process ancestry contains the recorded gateway
+pid (`~/.hermes/gateway.pid`).
+
 ### Shell hooks allowlist
 
 Some shell-hook integrations require explicit allowlisting before they fire. Managed via `~/.hermes/shell-hooks-allowlist.json` — prompted interactively the first time a hook wants to run.
@@ -698,7 +716,7 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 
 ## Durable & Background Systems
 
-Four systems run alongside the main conversation loop. Quick reference
+Several systems run alongside the main conversation loop. Quick reference
 here; full developer notes live in `AGENTS.md`, user-facing docs under
 `website/docs/user-guide/features/`.
 
@@ -742,6 +760,20 @@ the `cronjob` tool, the `hermes cron` CLI (`list`, `add`, `edit`,
   processes, cron sessions pass `skip_memory=True` by default, and cron
   deliveries are framed with a header/footer instead of being mirrored
   into the target gateway session (keeps role alternation intact).
+- **Misfire handling:** opt-in per-job `misfire_deadline_seconds` – a
+  recurring job that misses its slot by more than this skips the fire
+  (`last_status: skipped_stale`, rendered distinctly in `hermes cron
+  list`, one-line notice delivered) instead of firing late; unset
+  (default) keeps the fire-once-past-grace behaviour.
+- **Startup reconciliation:** at boot, orphaned runs (TTL-expired or
+  own-host `running_marker`) are marked `error` ("interrupted:
+  scheduler restarted mid-run") with one operator alert per job; set
+  distinct `HERMES_MACHINE_ID` values when running multiple instances
+  on one host.
+- **Per-run stats:** `last_run_stats` (`started_at`, `ended_at`,
+  `duration_s`, `exec_duration_s`, `api_calls`, `output_tokens`,
+  `exit_reason`) is persisted per run, plus a `cron.run_summary` INFO
+  log line independent of delivery.
 
 User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/cron
 
@@ -763,6 +795,11 @@ so nothing is lost.
   **off by default** — opt in with `curator.consolidate: true` or
   `hermes curator run --consolidate`. Routine background curation costs
   zero tokens.
+- **Denial breaker:** a background review aborts after repeated denied
+  privileged writes (default 5) and emits one operator alert.
+- **Injection scan:** curator-originated memory/skill writes are scanned
+  for injection patterns before persistence – a hit drops the write and
+  logs a warning; interactive writes are unaffected.
 - **Telemetry:** sidecar at `~/.hermes/skills/.usage.json` holds
   per-skill `use_count`, `view_count`, `patch_count`,
   `last_activity_at`, `state`, `pinned`.
@@ -799,6 +836,24 @@ sessions still have zero `kanban_*` schema footprint unless configured.
   within a board for workspace-path + memory-key isolation.
 
 User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban
+
+### Operator alerts
+
+`alerts.deliver` (a `platform:chat_id` target, same format cron
+`deliver` accepts; empty = off, the default) routes operator alerts –
+cron startup-reconciliation, high-severity security-audit findings,
+curator denial-breaker aborts – to one chat. Fire-and-forget, never
+raises; identical titles rate-limited to one per 15 minutes.
+
+### Model router (`routing.*`)
+
+Off by default (`routing.enabled: false`). Sends light vs heavy tasks
+to different models per tier (`routing.tiers.{light,standard,heavy}`)
+via heuristics plus an optional LLM tie-break classifier
+(`auxiliary.routing`); applies to origins in `routing.apply_to`
+(default `[cron, delegate]`; gateway and oneshot supported). Fails
+open and fills only the global-default gap – explicit per-job or
+per-call model overrides always win.
 
 ---
 
