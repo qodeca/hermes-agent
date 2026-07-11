@@ -1532,6 +1532,18 @@ def init_agent(
         _output_budget = 0
     agent._session_output_token_budget = _output_budget
 
+    # Repetition/degeneration detection: score each new assistant message
+    # for verbatim self-repetition; first strike steers via the next tool
+    # result, a second consecutive strike ends the turn with exit reason
+    # "degeneration_detected".  Off by default for interactive sessions —
+    # a human watching the stream can interrupt a loop — and defaulted ON
+    # for unattended cron sessions by the scheduler
+    # (cron.degeneration_detection), which applies only when this
+    # agent-level key is unset in config.yaml.
+    agent._degeneration_detection = bool(
+        _agent_section.get("degeneration_detection", False)
+    )
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)

@@ -1026,6 +1026,18 @@ DEFAULT_CONFIG = {
         # (cron.session_output_token_budget) that applies only when this
         # key is unset.  0 = unlimited.
         "session_output_token_budget": 0,
+        # Repetition/degeneration detection: score each new assistant
+        # message for verbatim self-repetition (8-gram overlap with the
+        # previous messages; the same line repeated within one message —
+        # the incident above was hundreds of copies of one line).  On the
+        # first detection the model is steered via the next tool result;
+        # a second CONSECUTIVE detection ends the turn with exit reason
+        # "degeneration_detected".  Default false for interactive
+        # sessions — a human watching the stream can see and interrupt a
+        # loop.  Cron sessions default to true via
+        # cron.degeneration_detection, which applies only when this key
+        # is unset; an explicit value here (true or false) always wins.
+        "degeneration_detection": False,
         # Default per-call output-token cap, applied only when no explicit
         # max_tokens is set (constructor arg or model.max_tokens).  A FIXED
         # cap sent on every API call via the provider-correct kwarg
@@ -2767,6 +2779,13 @@ DEFAULT_CONFIG = {
         # an explicit agent-level value (including 0 = unlimited) always
         # wins.  0 = unlimited.  Default 200000 output tokens.
         "session_output_token_budget": 200000,
+        # Repetition/degeneration detection for CRON sessions — enabled
+        # by default because nobody is watching an unattended job loop
+        # (the same incident: hundreds of copies of one line before a
+        # two-word answer).  Applies only when the agent-level
+        # agent.degeneration_detection key is UNSET in config.yaml; an
+        # explicit agent-level value (true or false) always wins.
+        "degeneration_detection": True,
     },
 
     # Operator alerts — a minimal, fire-and-forget notification primitive

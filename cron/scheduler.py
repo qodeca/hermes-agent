@@ -353,6 +353,33 @@ def _resolve_cron_session_output_budget(cfg: dict | None) -> int | None:
         return _DEFAULT_CRON_OUTPUT_TOKEN_BUDGET
 
 
+def _resolve_cron_degeneration_detection(cfg: dict | None) -> Optional[bool]:
+    """Resolve whether degeneration detection is on for a cron job's agent.
+
+    Cron sessions default it ON (``cron.degeneration_detection``, default
+    True) — a degenerating repetition loop in an unattended job has nobody
+    watching to interrupt it (the same incident as the output budget
+    above) — while interactive sessions default it OFF.
+
+    Precedence mirrors ``_resolve_cron_session_output_budget``: an
+    agent-level ``agent.degeneration_detection`` key present in
+    config.yaml always wins — including an explicit false — and agent
+    init already applied it, so this returns ``None`` ("leave the agent's
+    value alone"). Otherwise returns the cron value to set on the agent:
+    ``cron.degeneration_detection`` when configured, else True.
+    """
+    _agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+    if isinstance(_agent_cfg, dict) and "degeneration_detection" in _agent_cfg:
+        return None
+
+    _cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    _cron_cfg = _cron_cfg if isinstance(_cron_cfg, dict) else {}
+    _configured = _cron_cfg.get("degeneration_detection")
+    if _configured is None:
+        return True
+    return bool(_configured)
+
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
@@ -3193,6 +3220,11 @@ def run_job(
         # applied it and it must win (including an explicit 0 = unlimited).
         _cron_output_budget = _resolve_cron_session_output_budget(_cfg)
 
+        # Degeneration detection: cron sessions default it ON (nobody is
+        # watching an unattended loop).  None = the user set the
+        # agent-level key; agent init already applied it and it must win.
+        _cron_degeneration = _resolve_cron_degeneration_detection(_cfg)
+
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
 
@@ -3376,6 +3408,12 @@ def run_job(
         # agent from config).
         if _cron_output_budget is not None:
             agent._session_output_token_budget = _cron_output_budget
+
+        # Apply the cron degeneration-detection default resolved above
+        # (None means the user's agent-level key governs and is already
+        # on the agent from config).
+        if _cron_degeneration is not None:
+            agent._degeneration_detection = _cron_degeneration
 
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

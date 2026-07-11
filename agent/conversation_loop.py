@@ -29,6 +29,11 @@ from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
+from agent.degeneration_detector import (
+    looks_degenerate,
+    newest_assistant_index,
+    recent_assistant_texts,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
@@ -88,6 +93,20 @@ OUTPUT_BUDGET_WRAP_UP_NOTE = (
     "The session's output-token budget has been reached. This is the final "
     "model call for this turn: reply with a concise summary of what was "
     "accomplished and anything left incomplete. Do not call any more tools.\n"
+    "[/HERMES SYSTEM NOTICE]"
+)
+
+# Steering instruction delivered on the FIRST degeneration strike (see the
+# top-of-loop check in run_conversation). Same delivery channel as
+# OUTPUT_BUDGET_WRAP_UP_NOTE above: appended to the NEWEST tool result —
+# never a synthetic user or system message — so the cached prompt prefix
+# is untouched and strict role alternation is preserved.
+DEGENERATION_STEER_NOTE = (
+    "\n\n[HERMES SYSTEM NOTICE — not tool output]\n"
+    "Your recent replies are repeating the same text (a degenerating "
+    "loop). Stop re-deliberating: produce your final answer to the user's "
+    "request now, concisely, without restating earlier output. If the "
+    "repetition continues, this turn will be terminated.\n"
     "[/HERMES SYSTEM NOTICE]"
 )
 
@@ -637,6 +656,14 @@ def run_conversation(
     # Session output-token budget grace tracking: True once the model has
     # been granted its one wrap-up call after the budget tripped.
     output_budget_grace_granted = False
+    # Degeneration detection state (see the top-of-loop check): count of
+    # CONSECUTIVE degenerate assistant messages, the one-shot pending
+    # steer note, and the index of the newest assistant message already
+    # scored — primed from pre-turn history so a stale assistant message
+    # from an earlier turn is never scored as this turn's output.
+    degen_strikes = 0
+    degen_steer_pending = False
+    degen_last_scored_idx = newest_assistant_index(messages)
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
@@ -715,6 +742,54 @@ def run_conversation(
                 and isinstance(messages[-1].get("content"), str)
             ):
                 messages[-1]["content"] += OUTPUT_BUDGET_WRAP_UP_NOTE
+
+        # Repetition/degeneration detection: a looping model can emit the
+        # same deliberation endlessly while staying inside every other
+        # guard — max_iterations counts tool calls, the breaker counts
+        # failures, and the output budget needs volume to accumulate
+        # first (observed: 261 KB of "I'm done. Let me write the response
+        # now." for a two-word answer).  Checked here, at the top of the
+        # loop, so each NEW assistant message from the previous iteration
+        # is scored exactly once, against visible content only (reasoning
+        # legitimately revisits the same ground).  First strike: steer
+        # via the newest tool result (created this very iteration —
+        # cache- and alternation-safe, the same channel as
+        # OUTPUT_BUDGET_WRAP_UP_NOTE above); when the tail isn't a tool
+        # result the note simply stays pending for the next one — never a
+        # synthetic message.  Second CONSECUTIVE strike: end the turn
+        # through the same clean terminal path the budget/breaker exits
+        # use.  A clean message resets the strike count.  Config-gated:
+        # agent.degeneration_detection (default false for interactive
+        # sessions; cron sessions default true via the scheduler).
+        if getattr(agent, "_degeneration_detection", False):
+            _degen_newest_idx = newest_assistant_index(messages)
+            if _degen_newest_idx is not None and _degen_newest_idx != degen_last_scored_idx:
+                degen_last_scored_idx = _degen_newest_idx
+                _degen_newest_text = messages[_degen_newest_idx].get("content")
+                if isinstance(_degen_newest_text, str) and _degen_newest_text.strip():
+                    _degen_reason = looks_degenerate(recent_assistant_texts(messages))
+                    if _degen_reason:
+                        degen_strikes += 1
+                        if degen_strikes >= 2:
+                            _turn_exit_reason = "degeneration_detected"
+                            if not agent.quiet_mode:
+                                agent._safe_print(
+                                    f"\n⚠️  Degenerating repetition loop detected "
+                                    f"({_degen_reason}) — ending the turn"
+                                )
+                            break
+                        degen_steer_pending = True
+                    else:
+                        degen_strikes = 0
+            if (
+                degen_steer_pending
+                and messages
+                and isinstance(messages[-1], dict)
+                and messages[-1].get("role") == "tool"
+                and isinstance(messages[-1].get("content"), str)
+            ):
+                messages[-1]["content"] += DEGENERATION_STEER_NOTE
+                degen_steer_pending = False
 
         api_call_count += 1
         agent._api_call_count = api_call_count
