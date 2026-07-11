@@ -1739,6 +1739,22 @@ DEFAULT_CONFIG = {
             "timeout": 600,
             "extra_body": {},
         },
+        # Task-complexity router classifier — used only when
+        # ``routing.classifier: llm`` and the deterministic heuristics were
+        # ambiguous (see the top-level ``routing`` block and
+        # agent/model_router.py). One short single-token call per routed
+        # conversation start; keep this on a fast, cheap model. The timeout
+        # is deliberately tight because any failure simply falls back to
+        # ``routing.default_tier`` — a slow classifier must never delay a
+        # conversation start.
+        "routing": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 8,
+            "extra_body": {},
+        },
         # Monitor — urgency/importance classifier used by the important-mail
         # monitor catalog automation (cron/scripts/classify_items.py). Scores
         # candidate items 0-10 against the user's criteria so only above-
@@ -2687,6 +2703,50 @@ DEFAULT_CONFIG = {
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
+    },
+
+    # Task-complexity model router — pick a model tier (light / standard /
+    # heavy) per task at conversation start so a one-line reminder doesn't
+    # run on the same heavyweight model as a multi-hour research job.
+    # OFF by default; the decision logic lives in agent/model_router.py.
+    #
+    # Precedence (highest first) — the router never overrides an explicit
+    # choice: explicit per-job/per-call model > HERMES_MODEL env > session
+    # /model or channel override > router > global default.
+    #
+    # An empty tier model means "keep the existing resolution" for that
+    # tier, so the expected steady state is: configure only `light` (and
+    # optionally `heavy`), leave `standard` empty — the router is then a
+    # pure delta on today's behaviour.
+    "routing": {
+        "enabled": False,
+        # Which conversation origins the router applies to. Anything not
+        # listed keeps its existing model resolution untouched.
+        "apply_to": ["cron", "delegate"],  # cron | delegate | gateway | oneshot
+        # heuristic — deterministic rules only (default).
+        # llm       — heuristics first; an auxiliary LLM call breaks ties
+        #             (configure the backend under auxiliary.routing).
+        # off       — no classification; every routed task gets default_tier.
+        "classifier": "heuristic",
+        # Tier used when no heuristic is decisive (or the classifier fails).
+        "default_tier": "standard",
+        "tiers": {
+            "light":    {"provider": "", "model": "", "base_url": ""},
+            "standard": {"provider": "", "model": "", "base_url": ""},
+            "heavy":    {"provider": "", "model": "", "base_url": ""},
+        },
+        "heuristics": {
+            # Task text at or under this length (chars) reads as light,
+            # unless a heavy signal (toolset/keyword/length/structure) won first.
+            "light_max_chars": 280,
+            # Task text at or over this length (chars) reads as heavy.
+            "heavy_min_chars": 4000,
+            "light_keywords": ["remind", "greet", "ping", "notify", "send a message"],
+            "heavy_keywords": ["research", "investigate", "comprehensive",
+                               "deep dive", "migrate", "refactor", "crawl"],
+            # Toolsets whose presence marks a task heavy outright.
+            "heavy_toolsets": ["browser", "delegation"],
+        },
     },
 
     "cron": {
@@ -5331,7 +5391,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers", "alerts",
+    "sessions", "streaming", "updates", "mcp_servers", "alerts", "routing",
 }
 
 # Valid fields inside a custom_providers list entry
