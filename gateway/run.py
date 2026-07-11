@@ -16046,9 +16046,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         try:
             cfg = user_config if isinstance(user_config, dict) else _load_gateway_config()
-            # Cheap short-circuit for the default (routing absent/disabled)
-            # case; route_model below re-validates with strict coercion.
-            if not (cfg.get("routing") or {}):
+
+            # Gate BEFORE any side-effecting probe: a config with routing
+            # disabled (``routing: {enabled: false}``), absent, or without
+            # ``gateway`` in ``apply_to`` must do no work and log nothing.
+            # ``routing_applies`` uses the router's own strict coercion, so a
+            # disabled-but-present config is not mistaken for enabled. Guarded
+            # import — a broken router must never break a gateway session.
+            from agent.model_router import RouteContext, route_model, routing_applies
+
+            if not routing_applies(cfg, "gateway"):
                 return
 
             # Sticky map wins: a /model override — or an earlier routed
@@ -16081,10 +16088,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # A runtime provider that bundles its own model is an explicit pin.
             if _resolve_runtime_agent_kwargs().get("model"):
                 return
-
-            # Guarded import + guarded call: any router failure keeps the
-            # default resolution (outer except).
-            from agent.model_router import RouteContext, route_model
 
             toolsets: tuple = ()
             if source is not None:

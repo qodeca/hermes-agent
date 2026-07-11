@@ -17,6 +17,7 @@ from agent.model_router import (
     RouteDecision,
     _tier_model_available,
     route_model,
+    routing_applies,
 )
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -192,6 +193,30 @@ class TestGating:
         d = route_model(GREETING, context=ctx(), config=cfg)
         assert_noop(d)
         assert d.reason  # explains the fall-through
+
+
+class TestRoutingApplies:
+    """The side-effect-free gate callers use before expensive pre-routing work."""
+
+    def test_enabled_and_origin_in_apply_to(self):
+        assert routing_applies(make_config(apply_to=["gateway"]), "gateway") is True
+
+    def test_disabled_but_present_is_false(self):
+        # The core case: routing: {enabled: false} must read as OFF.
+        assert routing_applies(make_config(enabled=False), "cron") is False
+
+    def test_origin_not_in_apply_to_is_false(self):
+        assert routing_applies(make_config(apply_to=["cron"]), "gateway") is False
+
+    def test_absent_routing_key_is_false(self):
+        assert routing_applies({"model": {"default": "m"}}, "gateway") is False
+
+    def test_origin_coercion_matches_router(self):
+        # Case/whitespace coercion mirrors _route's origin handling.
+        assert routing_applies(make_config(apply_to=["gateway"]), " GATEWAY ") is True
+
+    def test_non_dict_config_is_false(self):
+        assert routing_applies("not-a-dict", "gateway") is False
 
 
 # ─── catalog resolution ──────────────────────────────────────────────────────

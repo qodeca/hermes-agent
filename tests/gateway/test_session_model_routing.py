@@ -313,48 +313,70 @@ class TestPrecedence:
 
 
 class TestGating:
-    def test_routing_disabled_no_seeding(self, store_factory):
+    def test_routing_disabled_but_present_no_probe_no_warning(
+        self, store_factory, caplog
+    ):
+        """``routing: {enabled: false}`` (explicitly present, disabled) must
+        short-circuit BEFORE any side-effecting probe and log nothing —
+        otherwise every new session runs a credential probe (and WARNs on
+        credential-less setups) even though routing is explicitly OFF."""
         store = store_factory()
         source = _make_source()
         session_key = store.get_or_create_session(source).session_key
         runner = _make_runner(store)
         cfg = make_user_config(enabled=False)
 
-        with patch(
-            "gateway.run._resolve_runtime_agent_kwargs",
-            return_value=_default_runtime_kwargs(),
-        ):
+        def _explode():  # the probe must never be reached when routing is off
+            raise AssertionError("provider probe called while routing disabled")
+
+        with caplog.at_level("WARNING"), patch(
+            "gateway.run._resolve_runtime_agent_kwargs", side_effect=_explode
+        ), patch("agent.model_router.route_model") as spy:
             _seed(runner, session_key, source, cfg)
+        assert spy.call_count == 0
         assert session_key not in runner._session_model_overrides
+        assert caplog.records == []
 
         model, _ = _resolve(runner, source, session_key, cfg)
         assert model == DEFAULT_MODEL
 
-    def test_gateway_not_in_apply_to_no_seeding(self, store_factory):
+    def test_gateway_not_in_apply_to_no_probe_no_warning(
+        self, store_factory, caplog
+    ):
         store = store_factory()
         source = _make_source()
         session_key = store.get_or_create_session(source).session_key
         runner = _make_runner(store)
         cfg = make_user_config(apply_to=("cron", "delegate"))
 
-        with patch(
-            "gateway.run._resolve_runtime_agent_kwargs",
-            return_value=_default_runtime_kwargs(),
-        ):
+        def _explode():
+            raise AssertionError("provider probe called while not applicable")
+
+        with caplog.at_level("WARNING"), patch(
+            "gateway.run._resolve_runtime_agent_kwargs", side_effect=_explode
+        ), patch("agent.model_router.route_model") as spy:
             _seed(runner, session_key, source, cfg)
+        assert spy.call_count == 0
         assert session_key not in runner._session_model_overrides
+        assert caplog.records == []
 
         model, _ = _resolve(runner, source, session_key, cfg)
         assert model == DEFAULT_MODEL
 
-    def test_no_routing_config_no_seeding(self, store_factory):
+    def test_no_routing_config_no_probe(self, store_factory):
+        """Absent ``routing:`` key (distinct from present-but-disabled)."""
         store = store_factory()
         source = _make_source()
         session_key = store.get_or_create_session(source).session_key
         runner = _make_runner(store)
         cfg = {"model": {"default": DEFAULT_MODEL}}
 
-        with patch("agent.model_router.route_model") as spy:
+        def _explode():
+            raise AssertionError("provider probe called with no routing config")
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs", side_effect=_explode
+        ), patch("agent.model_router.route_model") as spy:
             _seed(runner, session_key, source, cfg)
         assert spy.call_count == 0
         assert session_key not in runner._session_model_overrides

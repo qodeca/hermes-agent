@@ -452,6 +452,28 @@ def _route(
     return _decision_for_tier(tier, routing, default_tier, source, reason), True
 
 
+def routing_applies(config: dict, origin: str) -> bool:
+    """Return True when routing is enabled AND ``origin`` is in ``apply_to``.
+
+    A cheap, side-effect-free predicate for callers that want to gate
+    expensive pre-routing work (credential probes, catalog reads) BEFORE
+    consulting :func:`route_model` — a disabled-or-not-applicable config
+    should do no work and log nothing. Uses the same strict coercion as the
+    router itself, so ``routing: {enabled: false}`` and ``apply_to: cron``
+    are read identically here and there. Fail-safe: any error → False (skip
+    routing), never raises.
+    """
+    try:
+        cfg = config if isinstance(config, dict) else {}
+        routing = _dict_at(cfg, "routing")
+        if not _coerce_bool(routing.get("enabled"), False):
+            return False
+        apply_to = _coerce_str_tuple(routing.get("apply_to"), _DEFAULT_APPLY_TO)
+        return str(origin or "").strip().lower() in apply_to
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def route_model(
     task_text: str,
     *,
@@ -489,4 +511,5 @@ __all__ = [
     "RouteContext",
     "RouteDecision",
     "route_model",
+    "routing_applies",
 ]
