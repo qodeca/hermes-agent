@@ -2,7 +2,7 @@
 
 > **Audience:** Qodeca maintainer running Hermes as an always-on server on this Mac
 > **Scope:** Qodeca-specific runtime setup, not part of upstream Hermes docs
-> **Last updated:** 2026-07-09
+> **Last updated:** 2026-07-11
 
 Turns this MacBook into an always-on Hermes server that **runs from the fork source**
 (`~/Projects/hermes-agent`, editable install, branch `main`). Surfaces: Telegram + Slack
@@ -196,6 +196,116 @@ same access is available on every channel and inherited by subagents.
 - **Revoke:** `python $GS --revoke`, or Admin console → Security → API controls, or delete the
   token file. **Changing marian's account password also revokes the token** (Gmail scopes) and
   forces a re-auth.
+
+## Operational hardening knobs
+
+Config knobs worth setting on an always-on box. All of them live in `~/.hermes/config.yaml`
+or `~/.hermes/.env`; **edits take effect only after a gateway restart, run from a shell
+outside the gateway process** (`hermes gateway restart` refuses to run from inside its own
+gateway session — that's the restart guard, not a bug).
+
+### 1. Operator alerts (do this first)
+
+By default, cron-reconcile notices ("interrupted: scheduler restarted mid-run"),
+high-severity security-audit findings, and curator-abort events go to a log nobody reads.
+Route them to Telegram:
+
+```yaml
+# ~/.hermes/config.yaml
+alerts:
+  deliver: "telegram:<your chat id>"   # same platform:chat_id format cron `deliver` uses
+```
+
+Default is `""` (off). Delivery is fire-and-forget with a 15-minute identical-title rate
+limit, so a flapping condition can't flood the chat.
+
+### 2. Cron caps (a stuck job can no longer run unbounded)
+
+| Knob | Default | Bounds |
+|------|---------|--------|
+| `HERMES_CRON_MAX_RUNTIME` env / `cron.max_runtime_seconds` | `3600` | Wall-clock cap per cron run, regardless of activity; `0` = unlimited. Env wins over config. Sibling of the pre-existing `HERMES_CRON_TIMEOUT` inactivity timeout (600s). |
+| `cron.session_output_token_budget` | `200000` | Cumulative output tokens per cron session — a degenerating loop ends cleanly instead of burning tokens all night. |
+| `cron.max_iterations` | `40` | Agent-loop iteration cap for cron runs. Non-positive values fall back to the default — there is no "unlimited" setting. |
+
+The defaults are sane; verify them rather than raise them. Raise only for a specific
+long-running job, not globally.
+
+### 3. `HERMES_MACHINE_ID` (only if >1 instance on this host)
+
+Cron's startup reconciliation reaps running-markers that share this machine id. The default
+is host-derived, so two Hermes instances (e.g. two profiles) on one Mac will reap **each
+other's** live cron runs on restart. Set a distinct value per instance in each profile's
+`.env`:
+
+```bash
+HERMES_MACHINE_ID=hermes-main     # and e.g. hermes-dev in the other profile's .env
+```
+
+Single-instance setups (this box today) can skip this.
+
+### 4. Authorization survives restarts
+
+Pairing state can be lost across restarts; the owner then gets default-denied by their own
+bot. Persist the allowlist in `~/.hermes/.env`:
+
+```bash
+TELEGRAM_ALLOWED_USERS=<your numeric Telegram user id>
+```
+
+Opening a platform to everyone is per-platform now: `<PLATFORM>_ALLOW_ALL_USERS` (e.g.
+`TELEGRAM_ALLOW_ALL_USERS=true`). Any active allow-all triggers a startup operator alert
+naming the open platforms. The global `GATEWAY_ALLOW_ALL_USERS` still works but is
+deprecated and logs a startup warning. Audit the effective sources anytime with
+`/allowlist show` (admin-gated).
+
+### 5. Model router (optional, off by default)
+
+Send trivial cron/delegate jobs to a small model and heavy ones to a capable one:
+
+```yaml
+routing:
+  enabled: true                  # default false — a no-op until you flip it
+  tiers:
+    light:
+      provider: <provider>
+      model: <small model>
+    heavy:
+      provider: <provider>
+      model: <capable model>
+auxiliary:
+  routing: { ... }               # optional LLM tie-break classifier backend (same shape as auxiliary.compression)
+```
+
+It fills only the global-default gap — anything with an explicit model (per-job, per-session)
+keeps it. Fail-open: any router error means "use the default model", never a crash.
+
+### 6. Independent compression endpoint
+
+Context compression summarizes through the main model by default — so when the local oMLX
+backend is the thing failing (capacity errors), compression fails through the same failing
+endpoint. Point the summarizer somewhere else:
+
+```yaml
+auxiliary:
+  compression:
+    provider: <different provider>
+    model: <model>
+```
+
+Compression now also skips a backend that reports capacity errors and preserves messages
+instead of doing a lossy drop, but a genuinely independent endpoint is the robust fix.
+
+### 7. Cross-checks from the incident ops checklist
+
+- **SSH:** `PasswordAuthentication no`, `PermitRootLogin no` in `/etc/ssh/sshd_config`, and
+  OpenSSH ≥ 10.0. The startup security audit flags SSH password auth as high severity — with
+  knob 1 set, that finding reaches Telegram instead of a log.
+- **Request timeout:** set the provider's `request_timeout_seconds` explicitly; clients are
+  never built without a timeout (config → `HERMES_API_TIMEOUT` → 1800s fallback), but an
+  explicit value sized to the local model beats the generic default.
+- **Local model sizing:** size the oMLX `context_length` to what this Mac's memory actually
+  sustains — an oversized context turns into `prefill_memory_exceeded` capacity errors under
+  load (now classified as non-retryable, so they abort cleanly instead of looping).
 
 ## Security posture
 
