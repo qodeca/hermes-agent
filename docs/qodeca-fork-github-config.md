@@ -2,21 +2,23 @@
 
 > **Audience:** Qodeca maintainers of this fork
 > **Scope:** Qodeca-specific fork setup, not part of upstream Hermes docs
-> **Last updated:** 2026-07-09
+> **Last updated:** 2026-07-11
 
 ## Overview
 
 This repository is a **public fork**: `qodeca/hermes-agent`, forked from the original
 `NousResearch/hermes-agent`. `main` is kept **in sync with upstream** and now also carries
-**Qodeca-specific commits** – notably dashboard-auth security fixes and reverse-proxy
-(HTTPS) support, plus the fork's own docs. It is no longer a pure mirror.
+**Qodeca-specific commits** – dashboard-auth security fixes, reverse-proxy
+(HTTPS) support, a 63-commit overnight-run hardening batch (cron lifecycle,
+agent-loop resilience, model router, operator alerts, gateway authorization,
+curator guards), plus the fork's own docs. It is no longer a pure mirror.
 
 ## State at a glance
 
 | Aspect | State | Note |
 |--------|-------|------|
 | Fork relationship | `qodeca/hermes-agent` ← `NousResearch/hermes-agent` | Public, owned by the `qodeca` org |
-| `main` vs upstream | 13 ahead / 0 behind `upstream/main` | 11 Qodeca commits + 2 merges (PR #1, upstream sync); re-synced with `upstream/main` on 2026-07-09 |
+| `main` vs upstream | 87 ahead / 0 behind `upstream/main` | Earlier dashboard/fork work + the overnight-run hardening batch (63 commits) + fork docs; last upstream sync 2026-07-09 |
 | Git remotes | `origin` = qodeca, `upstream` = NousResearch | `upstream` push URL is set to `DISABLE` (fetch-only) |
 | Issues | **disabled** on the fork | Bug reports belong on the upstream repo |
 | Branches | ~1300 | Inherited from upstream (Nous dev branches, e.g. `alice/…`, `atropos-…`); the fork mirrors them |
@@ -35,7 +37,12 @@ Security and feature work carried on top of upstream (all PR-quality, upstreamab
   (`dashboard.trusted_proxy`, `dashboard.allowed_hosts`).
 - `feat(dashboard)` – opt-in "Readable" theme (Inter, 17px, plain chrome), aligned with the
   erfana fonts (PR #1, merged into `main`).
-- Fork docs: `CLAUDE.md`, this file, and `docs/hermes-server-setup.md`.
+- **Overnight-run hardening** (63 commits, 2026-07): 31 cron-reliability,
+  agent-loop-resilience, security, observability, and model-operations fixes
+  from a five-lens incident review — full record in
+  `docs/2026-07-overnight-run-hardening.md`.
+- Fork docs: `CLAUDE.md`, this file, `docs/hermes-server-setup.md`, and the
+  hardening changelog above.
 
 Plus a periodic **merge from `upstream/main`** to pull in new upstream work (most recently
 2026-07-09, bringing 85 upstream commits in on top of the Qodeca work).

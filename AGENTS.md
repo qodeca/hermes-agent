@@ -1108,8 +1108,9 @@ Invariants:
 - **Denial breaker:** a background review aborts after N denied privileged
   attempts (default 5), counting both whitelist blocks and in-tool guard
   refusals, and emits one operator alert — a misbehaving review can't hammer
-  guarded surfaces all night. (Known limitation: per-run scope; a cross-run
-  persistent counter is a follow-up.)
+  guarded surfaces all night. The counter is per-run — a fresh review starts
+  at zero — so it stops a single runaway review, not a slow drip across many
+  runs.
 - **Injection scan** (`tools/curator_write_guard.py`): every curator-originated
   memory/skill write (add/replace/batch, skill create/edit/patch/write_file)
   is scanned for injection patterns before persistence, gated on
