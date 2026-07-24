@@ -2,14 +2,16 @@
 
 > **Audience:** Qodeca maintainer running Hermes as an always-on server on this Mac
 > **Scope:** Qodeca-specific runtime setup, not part of upstream Hermes docs
-> **Last updated:** 2026-07-11
+> **Last updated:** 2026-07-24
 
 Turns this MacBook into an always-on Hermes server that **runs from the fork source**
 (`~/Projects/hermes-agent`, editable install, branch `main`). Surfaces: Telegram + Slack
 gateway, a web dashboard over **HTTPS on the tailnet**, and the local CLI. Model backend is
-the local oMLX server (`127.0.0.1:8000`, `ornith-1.0-35b-a3b-4bit`), itself a launchd agent.
+currently the DGX Spark cluster's **`deepseek-v4-flash`** endpoint (OpenAI-compatible, LAN
+`192.168.10.141:8000`); the local oMLX server (`127.0.0.1:8000`, `ornith-1.0-35b-a3b-4bit`,
+a launchd agent) still runs and Hermes can be pointed back to it at any time.
 
-**Dashboard URL:** `https://marcins-macbook-pro.sailfish-rooster.ts.net` (Tailscale Serve
+**Dashboard URL:** `https://macbook-m1.sailfish-rooster.ts.net` (Tailscale Serve
 terminates TLS with a Let's Encrypt cert and proxies to the loopback-bound dashboard;
 `admin` + the password from setup).
 
@@ -34,7 +36,7 @@ headless auto-login session after reboot.
 
 ## Status
 
-**Live now:** Dashboard over **HTTPS** at `https://marcins-macbook-pro.sailfish-rooster.ts.net`
+**Live now:** Dashboard over **HTTPS** at `https://macbook-m1.sailfish-rooster.ts.net`
 (valid Let's Encrypt cert via Tailscale Serve; loopback-bound backend, no direct tailnet-IP
 exposure; `__Host-…; Secure` session cookies; login verified). `config.yaml` hardened
 (`destructive_slash_confirm: true`, `dashboard.trusted_proxy: true`, `allowed_hosts`); rate-limit
@@ -43,6 +45,16 @@ dashboard healthy. **Telegram gateway** installed as a launchd service
 (`ai.hermes.gateway.plist`) and running (polling mode; Marcin paired; default-deny for unknown
 senders). Agent identity is the `SOUL.md` persona **Marian Kowalski** (AI Executive Assistant),
 with Google Workspace + shared-Chrome access on the default profile.
+
+**Model backend:** the active default is **`deepseek-v4-flash`** (reasoning MoE, 256K context)
+served OpenAI-compatible on the DGX Spark cluster at LAN `192.168.10.141:8000/v1`; bearer key at
+`~/.dgx-vllm-api-key` (mode 600), set as `model.api_key` in `config.yaml`. Two caveats: the
+cluster is a **bake-off — one model at a time**, so confirm `GET /v1/models` still lists
+`deepseek-v4-flash` (it may be serving Mistral); and the `base_url` is **LAN-pinned** to
+`192.168.10.141`, so if this Mac leaves `192.168.10.0/24` it must fall back to an SSH tunnel
+(`ssh -N -L 8000:192.168.10.141:8000 admin@100.123.251.74` → `http://127.0.0.1:8000/v1`). The
+local oMLX server still runs as an alternative; switch back by restoring `model.base_url` and
+`model.default` in `config.yaml`.
 
 **Pending (your steps):** FileVault off + auto-login (so the launchd Chrome + gateway reload after
 reboot); Telegram `/sethome` to set the home channel for cron results and alerts; Slack tokens if
@@ -65,7 +77,7 @@ The dashboard binds `127.0.0.1` (via the launcher), and `config.yaml` declares t
 dashboard:
   trusted_proxy: true          # forces the full auth gate + honors X-Forwarded-* (Secure cookies, real client IP)
   allowed_hosts:               # loopback bind accepts this proxied Host (else DNS-rebinding guard 400s it)
-    - marcins-macbook-pro.sailfish-rooster.ts.net
+    - macbook-m1.sailfish-rooster.ts.net
 ```
 
 ## Runbook — remaining manual steps
@@ -281,7 +293,7 @@ keeps it. Fail-open: any router error means "use the default model", never a cra
 
 ### 6. Independent compression endpoint
 
-Context compression summarizes through the main model by default — so when the local oMLX
+Context compression summarizes through the main model by default — so when the main model
 backend is the thing failing (capacity errors), compression fails through the same failing
 endpoint. Point the summarizer somewhere else:
 
